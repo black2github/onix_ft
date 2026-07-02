@@ -1,0 +1,49 @@
+chromedriver-win64/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# VS Code
+.vscode/
+
+# WireGuard private keys
+*.key
+*.conf
+*.dpapi
+
+# Docker
+*.log
+docker-compose.override.yml
+
+.env
+*.db
+*.log
+.vscode/
+.idea/
+chroma/
+
+# Test coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.pytest_cache/
+
+# Other test artifacts
+.tox/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
