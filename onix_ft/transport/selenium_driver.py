@@ -54,10 +54,11 @@ SEL_MESSAGE_ITEM = (By.CSS_SELECTOR, ".chat-message-row")
 
 # --- Селекторы для очистки истории чата -------------------------------------
 
-# Кнопка чата в списке чатов (ищем по имени чата из config.ONIX_CHAT_NAME)
+# Элемент чата в списке чатов (ищем по имени чата из config.ONIX_CHAT_NAME).
+# В DOM Onix это div.chat-list-entry, содержащий span с именем чата.
 SEL_CHAT_BUTTON_TMPL = (
-    "//button[.//div[contains(text(),'{name}')] or "
-    ".//span[contains(text(),'{name}')]]"
+    "//div[contains(@class,'chat-list-entry')]"
+    "[.//span[contains(@class,'chat-list-entry__name') and contains(text(),'{name}')]]"
 )
 
 # Пункт «Очистить историю чата» в контекстном меню
@@ -117,6 +118,11 @@ class OnixSeleniumTransport(BaseTransport):
         Если профиль не сохранён — даёт время залогиниться вручную.
         После загрузки помечаем все уже существующие сообщения как виденные,
         чтобы не обрабатывать историю чата.
+
+        Важно: Onix выполняет lazy-loading истории чата — сообщения
+        догружаются в DOM асинхронно после появления поля ввода. Поэтому
+        после обнаружения поля ввода делаем паузу и повторно обновляем
+        seen_ids, чтобы захватить всю подгрузившуюся историю.
         """
         timeout = timeout or config.PAGE_READY_TIMEOUT
         logger.info("Ожидание готовности страницы (до %.0f сек)...", timeout)
@@ -124,7 +130,23 @@ class OnixSeleniumTransport(BaseTransport):
             WebDriverWait(self._driver, timeout).until(
                 EC.presence_of_element_located(SEL_INPUT_BOX)
             )
+            # Первый снимок — захватываем то, что уже есть в DOM
             self._refresh_seen_ids()
+
+            # Пауза для завершения lazy-loading истории чата.
+            # Onix подгружает историю асинхронно после рендера страницы —
+            # без паузы часть старых сообщений появится в DOM уже после
+            # того как seen_ids был заполнен, и будет ошибочно принята
+            # за новые входящие сообщения.
+            logger.info(
+                "Ожидание догрузки истории чата (%.0f сек)...",
+                config.HISTORY_SETTLE_TIME
+            )
+            time.sleep(config.HISTORY_SETTLE_TIME)
+
+            # Второй снимок — захватываем всё что догрузилось за паузу
+            self._refresh_seen_ids()
+
         except TimeoutException:
             raise RuntimeError(
                 "Поле ввода не появилось за отведённое время. "
