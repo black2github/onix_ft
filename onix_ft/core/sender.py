@@ -39,7 +39,6 @@ logger = logging.getLogger("onix_ft.sender")
 
 MAX_RETRIES:   int   = 5      # сколько раз повторить окно при NACK/таймауте
 ACK_TIMEOUT:   float = 120.0  # секунд ждать ACK на всё окно
-POLL_INTERVAL: float = 2.0    # секунд между опросами transport.poll_new_messages()
 
 
 # ── отправитель ──────────────────────────────────────────────────────────────
@@ -359,7 +358,7 @@ class FileSender:
                     self._frame_buf.append(frame)
             if found is not None:
                 return found
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None
 
     def _try_decode(self, raw: str, file_id: str) -> Optional[Frame]:

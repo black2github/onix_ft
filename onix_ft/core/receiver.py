@@ -32,7 +32,6 @@ logger = logging.getLogger("onix_ft.receiver")
 
 META_WAIT_TIMEOUT:  float = 3600.0
 BLOCK_WAIT_TIMEOUT: float = 120.0
-POLL_INTERVAL:      float = 2.0
 
 
 class FileReceiver:
@@ -177,7 +176,7 @@ class FileReceiver:
                 frame = self._try_decode_any(raw)
                 if frame and frame.type == FrameType.META:
                     return frame, self._init_checkpoint(frame)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None, None
 
     def _init_checkpoint(self, meta: Frame) -> ReceiverCheckpoint:
@@ -227,7 +226,7 @@ class FileReceiver:
                     return None
             if self._data_buf:
                 return self._data_buf.pop(0)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None
 
     # ── хранение частичных блоков ────────────────────────────────────────────
