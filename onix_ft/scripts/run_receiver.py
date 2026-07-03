@@ -1,11 +1,12 @@
 """
 Запуск получателя.
 
-Использование (из корня проекта):
-    python -m onix_ft.scripts.run_receiver --out-dir ./received
+Использование:
+    python -m onix_ft.scripts.run_receiver --out-dir .\received
+    python -m onix_ft.scripts.run_receiver --out-dir .\received --clear-history
 
-Скрипт ждёт META-кадр от отправителя и принимает файл.
-Остановить вручную (Ctrl+C) — можно безопасно, прогресс сохранён в чекпойнте.
+Флаг --clear-history очищает историю чата перед началом приёма.
+Рекомендуется использовать всегда, чтобы получатель не читал старые кадры.
 """
 
 import argparse
@@ -19,8 +20,8 @@ from onix_ft.transport.selenium_driver import OnixSeleniumTransport
 from onix_ft.core.receiver import FileReceiver
 
 logging.basicConfig(
-    level  = logging.INFO,
-    format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level   = logging.DEBUG,
+    format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt = "%H:%M:%S",
 )
 logger = logging.getLogger("run_receiver")
@@ -36,7 +37,12 @@ def main():
     parser.add_argument(
         "--ckpt-dir",
         default=".",
-        help="Директория для чекпойнтов",
+        help="Директория для чекпойнтов (по умолчанию: текущая)",
+    )
+    parser.add_argument(
+        "--clear-history",
+        action="store_true",
+        help="Очистить историю чата перед началом приёма (рекомендуется)",
     )
     parser.add_argument(
         "--no-wait",
@@ -52,7 +58,19 @@ def main():
         transport.wait_ready()
 
         if not args.no_wait:
-            input("\n[→] Браузер открыт. Убедитесь, что нужный чат активен, затем нажмите Enter...\n")
+            input("\n[→] Браузер открыт. Убедитесь, что нужный чат активен, "
+                  "затем нажмите Enter...\n")
+
+        if args.clear_history:
+            logger.info("Очистка истории чата перед приёмом...")
+            ok = transport.clear_chat_history()
+            if not ok:
+                logger.error(
+                    "Не удалось очистить историю чата. "
+                    "Продолжить без очистки? (y/n)"
+                )
+                if input().strip().lower() != 'y':
+                    sys.exit(1)
 
         receiver = FileReceiver(transport, out_dir=out_dir, ckpt_dir=ckpt_dir)
         result   = receiver.receive_file()
