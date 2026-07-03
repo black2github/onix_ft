@@ -47,7 +47,7 @@ ELEMENT_WAIT_TIMEOUT: float = 15.0
 SEND_BTN_TIMEOUT: float = 5.0
 
 # Задержка после нажатия «Отправить» перед следующим действием.
-SEND_DELAY: float = 1.5
+SEND_DELAY: float = 0.8
 
 # Ожидание готовности страницы при старте (включая время ручного логина).
 PAGE_READY_TIMEOUT: float = 120.0
@@ -81,4 +81,4 @@ CLEAR_CHAT_EVERY_N_BLOCKS: int = 10
 #
 # При потере блока receiver шлёт NACK, sender откатывается и повторяет
 # окно начиная с потерянного блока.
-WINDOW_SIZE: int = 5
+WINDOW_SIZE: int = 10
