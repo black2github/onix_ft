@@ -26,6 +26,7 @@ from .protocol   import (
     make_file_id, make_meta_frame, make_data_frame, make_abort_frame,
 )
 from ..transport.base import BaseTransport
+from .. import config
 
 logger = logging.getLogger("onix_ft.sender")
 
@@ -46,6 +47,8 @@ class FileSender:
         # Буфер входящих кадров: кадры, пришедшие "не вовремя" (например, DONE
         # пришёл пока мы ещё обрабатывали последний ACK), чтобы не потерять их.
         self._frame_buf: list[Frame] = []
+        # Счётчик блоков, переданных с момента последней очистки чата.
+        self._blocks_since_clear: int = 0
 
     def send_file(self, source_path: Path) -> bool:
         """
@@ -137,6 +140,22 @@ class FileSender:
                 return False
 
             cp.confirm_block(seq)
+            self._blocks_since_clear += 1
+
+            # Периодическая очистка чата для контроля накопления сообщений.
+            # Выполняется после каждых CLEAR_CHAT_EVERY_N_BLOCKS успешно
+            # переданных блоков, если параметр задан и транспорт поддерживает очистку.
+            n = config.CLEAR_CHAT_EVERY_N_BLOCKS
+            if n > 0 and self._blocks_since_clear >= n:
+                next_seq = seq + 1
+                is_last  = (next_seq >= cp.total_blocks)
+                if not is_last:
+                    logger.info(
+                        "Передано %d блоков — очищаем чат перед продолжением...",
+                        self._blocks_since_clear
+                    )
+                    self._try_clear_chat()
+                    self._blocks_since_clear = 0
 
         # ── шаг 3: ожидание DONE от получателя ───────────────────────────────
         logger.info("Все блоки отправлены. Ожидаем DONE от получателя...")
@@ -266,6 +285,26 @@ class FileSender:
         except FrameDecodeError as e:
             logger.warning("Битый кадр (игнорируем): %s", e)
             return None
+
+    def _try_clear_chat(self):
+        """
+        Попытаться очистить историю чата через транспорт.
+        Если транспорт не поддерживает очистку — тихо пропускаем.
+        Ошибка очистки не прерывает передачу — только логируется.
+        """
+        if not hasattr(self._t, 'clear_chat_history'):
+            logger.debug("Транспорт не поддерживает clear_chat_history — пропускаем.")
+            return
+        try:
+            ok = self._t.clear_chat_history()
+            if ok:
+                logger.info("Чат очищён.")
+            else:
+                logger.warning(
+                    "Не удалось очистить чат — продолжаем передачу без очистки."
+                )
+        except Exception as e:
+            logger.warning("Ошибка при очистке чата: %s — продолжаем.", e)
 
     def _send_abort(self, file_id: str, reason: str):
         try:

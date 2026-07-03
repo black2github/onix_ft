@@ -273,13 +273,17 @@ class OnixSeleniumTransport(BaseTransport):
         input_el.click()
         time.sleep(0.2)
 
-        # Очищаем поле перед вставкой: Ctrl+A выделяет весь текст (если есть),
-        # execCommand('delete') удаляет выделение.
-        # Placeholder при этом не трогается — он не является текстом в DOM.
-        input_el.send_keys(Keys.CONTROL, 'a')
-        time.sleep(0.1)
+        # Очищаем поле перед вставкой через JS — без send_keys(Ctrl+A).
+        # Причина: send_keys отправляет события клавиатуры в активный элемент
+        # браузера. Если пользователь в этот момент работает в другом чате,
+        # фокус может сместиться туда и Ctrl+A выделит текст в чужом чате.
+        # JS-вызов focus() + selectAll работает точечно с конкретным элементом
+        # независимо от того, где находится фокус пользователя.
         self._driver.execute_script(
-            "document.execCommand('delete', false, null);"
+            "arguments[0].focus();"
+            "document.execCommand('selectAll', false, null);"
+            "document.execCommand('delete', false, null);",
+            input_el
         )
         time.sleep(0.1)
 
