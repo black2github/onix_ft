@@ -1,15 +1,20 @@
 """
-Конечный автомат отправителя.
+Конечный автомат отправителя — оконный протокол (sliding window).
 
 Алгоритм:
   1. Читать/создать чекпойнт.
   2. Отправить META, ждать ACK(META).
-  3. Для каждого блока начиная с last_acked+1:
-       а. Отправить DATA[seq].
-       б. Ждать ACK[seq] или NACK[seq].
-       в. NACK или таймаут → повторить (до MAX_RETRIES раз).
+  3. Передача окнами по WINDOW_SIZE блоков:
+       а. Отправить W блоков подряд без ожидания ACK между ними.
+       б. Ждать ACK[last] от получателя (подтверждение всего окна).
+       в. При NACK[N] — откатиться к блоку N и повторить окно с него.
+       г. При таймауте — повторить всё окно (до MAX_RETRIES раз).
+       д. После каждых CLEAR_CHAT_EVERY_N_BLOCKS блоков — очистить чат.
   4. Получить DONE от получателя, сверить sha256.
   5. Удалить чекпойнт.
+
+Совместимость: при WINDOW_SIZE=1 протокол деградирует до stop-and-wait,
+полностью совместимого со старым receiver.
 """
 
 from __future__ import annotations
@@ -32,8 +37,8 @@ logger = logging.getLogger("onix_ft.sender")
 
 # ── настройки ────────────────────────────────────────────────────────────────
 
-MAX_RETRIES:   int   = 5      # сколько раз повторить блок при NACK/таймауте
-ACK_TIMEOUT:   float = 120.0  # секунд ждать ACK на каждый блок
+MAX_RETRIES:   int   = 5      # сколько раз повторить окно при NACK/таймауте
+ACK_TIMEOUT:   float = 120.0  # секунд ждать ACK на всё окно
 POLL_INTERVAL: float = 2.0    # секунд между опросами transport.poll_new_messages()
 
 
@@ -44,8 +49,7 @@ class FileSender:
     def __init__(self, transport: BaseTransport, ckpt_dir: Optional[Path] = None):
         self._t        = transport
         self._ckpt_dir = ckpt_dir or Path(".")
-        # Буфер входящих кадров: кадры, пришедшие "не вовремя" (например, DONE
-        # пришёл пока мы ещё обрабатывали последний ACK), чтобы не потерять их.
+        # Буфер входящих кадров: кадры, пришедшие «не вовремя», чтобы не потерять.
         self._frame_buf: list[Frame] = []
         # Счётчик блоков, переданных с момента последней очистки чата.
         self._blocks_since_clear: int = 0
@@ -62,19 +66,13 @@ class FileSender:
         cp = SenderCheckpoint.load(ckpt_path)
         if cp:
             # Проверяем что файл на диске не изменился с момента создания чекпойнта.
-            # Сравниваем sha256 — это единственная надёжная проверка: размер файла
-            # может совпасть случайно, а количество блоков не меняется при малых
-            # изменениях содержимого внутри одного блока.
             actual_sha256 = file_sha256(source_path)
             if actual_sha256 != cp.sha256:
                 logger.error(
                     "Файл %s изменился с момента создания чекпойнта! "
                     "SHA256 в чекпойнте: %s, SHA256 на диске: %s. "
                     "Удалите чекпойнт %s и запустите передачу заново.",
-                    source_path.name,
-                    cp.sha256,
-                    actual_sha256,
-                    ckpt_path,
+                    source_path.name, cp.sha256, actual_sha256, ckpt_path,
                 )
                 return False
             logger.info(
@@ -98,18 +96,22 @@ class FileSender:
         # Разбиваем файл на блоки (нужны всегда — даже при восстановлении).
         blocks = split_file(source_path)
 
+        window_size = max(1, config.WINDOW_SIZE)
         logger.info(
-            "Файл: %s | %d байт | %d блоков | file_id=%s",
-            source_path.name, source_path.stat().st_size, cp.total_blocks, cp.file_id
+            "Файл: %s | %d байт | %d блоков | file_id=%s | окно=%d",
+            source_path.name, source_path.stat().st_size,
+            cp.total_blocks, cp.file_id, window_size
         )
 
         # ── шаг 1: META ──────────────────────────────────────────────────────
         if not cp.meta_acked:
             logger.info("Отправка META...")
-            meta_frame = make_meta_frame(cp.file_id, source_path, cp.total_blocks, cp.sha256)
+            meta_frame = make_meta_frame(
+                cp.file_id, source_path, cp.total_blocks, cp.sha256
+            )
             ok = self._send_and_wait_ack(
                 frame        = meta_frame,
-                expected_seq = 0,    # ACK на META: получатель шлёт ACK seq=0
+                expected_seq = 0,
                 file_id      = cp.file_id,
                 is_meta      = True,
             )
@@ -118,44 +120,28 @@ class FileSender:
             cp.confirm_meta()
             logger.info("META подтверждена.")
 
-        # ── шаг 2: DATA блоки ────────────────────────────────────────────────
-        start_seq = cp.next_seq
-        for seq in range(start_seq, cp.total_blocks):
-            data_frame = make_data_frame(cp.file_id, seq, cp.total_blocks, blocks[seq])
+        # ── шаг 2: DATA блоки окнами ─────────────────────────────────────────
+        seq = cp.next_seq
+        while seq < cp.total_blocks:
+            # Границы текущего окна
+            win_start = seq
+            win_end   = min(seq + window_size, cp.total_blocks) - 1  # включительно
 
-            logger.info(
-                "Блок %d/%d (%d байт b64=%d символов)...",
-                seq + 1, cp.total_blocks,
-                len(blocks[seq]), len(data_frame.payload)
-            )
-
-            ok = self._send_and_wait_ack(
-                frame        = data_frame,
-                expected_seq = seq,
-                file_id      = cp.file_id,
+            ok, next_seq = self._send_window(
+                blocks    = blocks,
+                win_start = win_start,
+                win_end   = win_end,
+                cp        = cp,
+                file_id   = cp.file_id,
             )
             if not ok:
-                logger.error("Не удалось передать блок %d после %d попыток. Прерываем.", seq, MAX_RETRIES)
-                self._send_abort(cp.file_id, f"Блок {seq} не подтверждён после {MAX_RETRIES} попыток")
+                self._send_abort(
+                    cp.file_id,
+                    f"Окно [{win_start}..{win_end}] не подтверждено после {MAX_RETRIES} попыток"
+                )
                 return False
 
-            cp.confirm_block(seq)
-            self._blocks_since_clear += 1
-
-            # Периодическая очистка чата для контроля накопления сообщений.
-            # Выполняется после каждых CLEAR_CHAT_EVERY_N_BLOCKS успешно
-            # переданных блоков, если параметр задан и транспорт поддерживает очистку.
-            n = config.CLEAR_CHAT_EVERY_N_BLOCKS
-            if n > 0 and self._blocks_since_clear >= n:
-                next_seq = seq + 1
-                is_last  = (next_seq >= cp.total_blocks)
-                if not is_last:
-                    logger.info(
-                        "Передано %d блоков — очищаем чат перед продолжением...",
-                        self._blocks_since_clear
-                    )
-                    self._try_clear_chat()
-                    self._blocks_since_clear = 0
+            seq = next_seq
 
         # ── шаг 3: ожидание DONE от получателя ───────────────────────────────
         logger.info("Все блоки отправлены. Ожидаем DONE от получателя...")
@@ -175,9 +161,118 @@ class FileSender:
             )
             return False
 
-        logger.info("✓ Передача завершена успешно. SHA256 совпадает.")
+        logger.info("Передача завершена успешно. SHA256 совпадает.")
         cp.delete()
         return True
+
+    # ── передача одного окна ─────────────────────────────────────────────────
+
+    def _send_window(
+        self,
+        blocks:    list[bytes],
+        win_start: int,
+        win_end:   int,
+        cp:        SenderCheckpoint,
+        file_id:   str,
+    ) -> tuple[bool, int]:
+        """
+        Отправить окно блоков [win_start..win_end] и дождаться ACK.
+
+        Возвращает (True, next_seq) при успехе или (False, win_start) при ошибке.
+
+        При получении NACK[N] — откатываемся к блоку N внутри текущей попытки.
+        Полный откат (повтор всего окна) происходит при таймауте или исчерпании
+        внутренних попыток отката.
+        """
+        logger.info(
+            "Окно [%d..%d] из %d блоков...",
+            win_start, win_end, cp.total_blocks
+        )
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if attempt > 1:
+                logger.warning("  Повтор окна [%d..%d], попытка %d/%d...",
+                               win_start, win_end, attempt, MAX_RETRIES)
+
+            # Отправляем все блоки окна подряд без ожидания ACK
+            send_from = win_start if attempt == 1 else win_start
+            for seq in range(send_from, win_end + 1):
+                frame = make_data_frame(file_id, seq, cp.total_blocks, blocks[seq])
+                logger.debug(
+                    "  → DATA[%d/%d] (%d байт)",
+                    seq + 1, cp.total_blocks, len(blocks[seq])
+                )
+                self._t.send(frame.encode())
+
+            # Ждём ACK на последний блок окна (или NACK на любой блок)
+            response = self._wait_for_frame(
+                expected_type = FrameType.ACK,
+                file_id       = file_id,
+                timeout       = ACK_TIMEOUT,
+                expected_seq  = win_end,
+                also_accept   = FrameType.NACK,
+            )
+
+            if response is None:
+                logger.warning("  Таймаут ожидания ACK[%d].", win_end)
+                continue  # повторяем всё окно
+
+            if response.type == FrameType.NACK:
+                nack_seq = response.seq
+                logger.warning(
+                    "  NACK[%d] — получатель запросил повтор с блока %d.",
+                    nack_seq, nack_seq
+                )
+                # Откатываемся к блоку nack_seq внутри окна
+                win_start = nack_seq
+                continue
+
+            if response.type == FrameType.ACK:
+                acked_seq = response.seq
+                if acked_seq < win_end:
+                    # Получатель подтвердил только часть окна — принимаем как есть,
+                    # следующее окно начнём с acked_seq + 1
+                    logger.info(
+                        "  ACK[%d] (частичное подтверждение, ожидали %d).",
+                        acked_seq, win_end
+                    )
+                else:
+                    logger.info("  ACK[%d] ✓", acked_seq)
+
+                # Подтверждаем все блоки окна до acked_seq включительно
+                for seq in range(cp.next_seq, acked_seq + 1):
+                    cp.confirm_block(seq)
+                    self._blocks_since_clear += 1
+
+                # Периодическая очистка чата
+                self._maybe_clear_chat(next_seq=acked_seq + 1, total=cp.total_blocks)
+
+                return True, acked_seq + 1
+
+        # Все попытки исчерпаны
+        logger.error(
+            "Окно [%d..%d] не подтверждено после %d попыток.",
+            win_start, win_end, MAX_RETRIES
+        )
+        return False, win_start
+
+    # ── периодическая очистка чата ───────────────────────────────────────────
+
+    def _maybe_clear_chat(self, next_seq: int, total: int):
+        """
+        Очистить чат если передано достаточно блоков и это не последний блок.
+        """
+        n = config.CLEAR_CHAT_EVERY_N_BLOCKS
+        if n <= 0 or self._blocks_since_clear < n:
+            return
+        if next_seq >= total:
+            return  # последний блок — не чистим перед ожиданием DONE
+        logger.info(
+            "Передано %d блоков — очищаем чат перед продолжением...",
+            self._blocks_since_clear
+        )
+        self._try_clear_chat()
+        self._blocks_since_clear = 0
 
     # ── вспомогательные методы ───────────────────────────────────────────────
 
@@ -188,20 +283,19 @@ class FileSender:
         file_id: str,
         is_meta: bool = False,
     ) -> bool:
-        """Отправить кадр, ждать ACK. При NACK/таймауте — повторить. True = успех."""
+        """Отправить одиночный кадр (META), ждать ACK. True = успех."""
         for attempt in range(1, MAX_RETRIES + 1):
             if attempt > 1:
                 logger.warning("  Повтор %d/%d...", attempt, MAX_RETRIES)
 
             self._t.send(frame.encode())
 
-            # Ожидаем ACK с нужным seq
             ack = self._wait_for_frame(
-                expected_type  = FrameType.ACK,
-                file_id        = file_id,
-                timeout        = ACK_TIMEOUT,
-                expected_seq   = expected_seq if not is_meta else None,
-                also_accept    = FrameType.NACK,
+                expected_type = FrameType.ACK,
+                file_id       = file_id,
+                timeout       = ACK_TIMEOUT,
+                expected_seq  = expected_seq if not is_meta else None,
+                also_accept   = FrameType.NACK,
             )
 
             if ack is None:
@@ -209,12 +303,11 @@ class FileSender:
                 continue
 
             if ack.type == FrameType.ACK:
-                # Для META получатель шлёт ACK с seq=-1
                 if is_meta or ack.seq == expected_seq:
                     return True
-                else:
-                    logger.warning("  ACK с неожиданным seq=%d (ожидали %d).", ack.seq, expected_seq)
-
+                logger.warning(
+                    "  ACK с неожиданным seq=%d (ожидали %d).", ack.seq, expected_seq
+                )
             elif ack.type == FrameType.NACK:
                 logger.warning("  Получен NACK seq=%d.", ack.seq)
 
@@ -225,13 +318,12 @@ class FileSender:
         expected_type: FrameType,
         file_id: str,
         timeout: float,
-        expected_seq: Optional[int] = None,
-        also_accept: Optional[FrameType] = None,
+        expected_seq:  Optional[int]       = None,
+        also_accept:   Optional[FrameType] = None,
     ) -> Optional[Frame]:
         """
-        Блокирующий опрос: ждать кадр нужного типа, игнорируя
-        обычные сообщения чата и чужие кадры.
-        Буферизует кадры, пришедшие «не вовремя», чтобы не потерять их.
+        Блокирующий опрос: ждать кадр нужного типа.
+        Буферизует «внеочередные» кадры, чтобы не потерять их.
         """
         def _matches(frame: Frame) -> bool:
             if frame.type == expected_type:
@@ -240,7 +332,7 @@ class FileSender:
                 return True
             return False
 
-        # Сначала проверяем буфер (кадры, пришедшие раньше)
+        # Сначала проверяем буфер
         for i, frame in enumerate(self._frame_buf):
             if _matches(frame):
                 self._frame_buf.pop(i)
@@ -248,9 +340,6 @@ class FileSender:
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            # Забираем все новые сообщения разом и обрабатываем полный батч.
-            # Нужный кадр может оказаться не первым (например, DONE пришёл
-            # в том же батче, что и последний ACK).
             batch = list(self._t.poll_new_messages())
             found: Optional[Frame] = None
             for raw in batch:
@@ -261,9 +350,8 @@ class FileSender:
                     logger.error("Получен ABORT от получателя: %s", frame.payload)
                     return None
                 if found is None and _matches(frame):
-                    found = frame  # запоминаем первый подходящий
+                    found = frame
                 else:
-                    # Остальные — в буфер, чтобы не потерять
                     logger.debug(
                         "Буферизуем кадр %s seq=%d (ждём %s)",
                         frame.type, frame.seq, expected_type
@@ -278,9 +366,9 @@ class FileSender:
         try:
             frame = Frame.decode(raw)
             if frame is None:
-                return None  # обычное сообщение чата
+                return None
             if frame.file_id != file_id:
-                return None  # кадр другой сессии
+                return None
             return frame
         except FrameDecodeError as e:
             logger.warning("Битый кадр (игнорируем): %s", e)
@@ -289,7 +377,6 @@ class FileSender:
     def _try_clear_chat(self):
         """
         Попытаться очистить историю чата через транспорт.
-        Если транспорт не поддерживает очистку — тихо пропускаем.
         Ошибка очистки не прерывает передачу — только логируется.
         """
         if not hasattr(self._t, 'clear_chat_history'):
@@ -300,9 +387,7 @@ class FileSender:
             if ok:
                 logger.info("Чат очищён.")
             else:
-                logger.warning(
-                    "Не удалось очистить чат — продолжаем передачу без очистки."
-                )
+                logger.warning("Не удалось очистить чат — продолжаем без очистки.")
         except Exception as e:
             logger.warning("Ошибка при очистке чата: %s — продолжаем.", e)
 

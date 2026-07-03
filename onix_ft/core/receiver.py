@@ -1,15 +1,13 @@
 """
-Конечный автомат получателя.
+Конечный автомат получателя — оконный протокол (sliding window).
 
-Алгоритм:
-  1. Ждать кадр META — из него узнаём имя файла, размер, sha256, число блоков.
-     Подтвердить ACK(seq=-1).
-  2. Ждать DATA-блоки в любом порядке (stop-and-wait с нашей стороны означает,
-     что блоки придут строго последовательно, но на всякий случай обрабатываем
-     дубликаты идемпотентно).
-     На каждый блок: сохранить, отправить ACK. При ошибке CRC протокола — NACK.
-  3. После получения всех блоков: собрать файл, проверить sha256, отправить DONE.
-  4. Удалить чекпойнт.
+Алгоритм получателя прост и не зависит от размера окна отправителя:
+  - Принимаем блоки по одному (как они приходят).
+  - ACK шлём на каждый WINDOW_SIZE-й блок (или на последний).
+  - При пропуске блока — NACK с номером первого недостающего.
+
+Отправитель управляет размером окна сам. Receiver только подтверждает
+накопленные блоки пакетом, уменьшая число сообщений в чате в WINDOW_SIZE раз.
 """
 
 from __future__ import annotations
@@ -28,14 +26,13 @@ from .protocol   import (
     make_done_frame, make_abort_frame,
 )
 from ..transport.base import BaseTransport
+from .. import config
 
 logger = logging.getLogger("onix_ft.receiver")
 
-# ── настройки ────────────────────────────────────────────────────────────────
-
-META_WAIT_TIMEOUT: float = 3600.0  # ждём META (может, отправитель ещё не запустился)
-BLOCK_WAIT_TIMEOUT: float = 120.0  # ждём каждый DATA-блок
-POLL_INTERVAL: float = 2.0
+META_WAIT_TIMEOUT:  float = 3600.0
+BLOCK_WAIT_TIMEOUT: float = 120.0
+POLL_INTERVAL:      float = 2.0
 
 
 class FileReceiver:
@@ -43,169 +40,173 @@ class FileReceiver:
     def __init__(
         self,
         transport: BaseTransport,
-        out_dir: Path,
-        ckpt_dir: Optional[Path] = None,
+        out_dir:   Path,
+        ckpt_dir:  Optional[Path] = None,
     ):
         self._t        = transport
         self._out_dir  = out_dir.resolve()
         self._ckpt_dir = ckpt_dir or Path(".")
         self._out_dir.mkdir(parents=True, exist_ok=True)
+        # Буфер DATA-кадров: poll может вернуть несколько блоков за раз,
+        # а мы обрабатываем их по одному — остаток сохраняем здесь.
+        self._data_buf: list[Frame] = []
 
     def receive_file(self) -> Optional[Path]:
-        """
-        Ждать и принять один файл.
-        Возвращает путь к принятому файлу или None при ошибке.
-        """
+        """Принять один файл. Возвращает путь или None при ошибке."""
 
-        # ── шаг 1: ждём META ─────────────────────────────────────────────────
-        logger.info("Ожидание META от отправителя (до %.0f сек)...", META_WAIT_TIMEOUT)
+        # ── шаг 1: META ──────────────────────────────────────────────────────
+        logger.info(
+            "Ожидание META от отправителя (до %.0f сек)...", META_WAIT_TIMEOUT
+        )
         meta_frame, cp = self._wait_for_meta()
         if meta_frame is None:
             logger.error("META не получена — таймаут.")
             return None
 
-        # Отправляем ACK на META (seq=0, тип META_ACK условно кодируем как ACK с seq=0)
         self._t.send(make_ack_frame(cp.file_id, seq=0).encode())
         logger.info(
             "META принята: файл=%s, размер=%d байт, блоков=%d, file_id=%s",
             cp.filename, cp.file_size, cp.total_blocks, cp.file_id
         )
 
-        # Буфер для блоков: номер_блока → байты
-        # Если чекпойнт загружен — уже принятые блоки восстанавливаем с диска
-        block_buf = self._restore_partial_blocks(cp)
+        block_buf        = self._restore_partial_blocks(cp)
+        window_size      = max(1, config.WINDOW_SIZE)
+        blocks_since_ack = 0   # сколько блоков принято с момента последнего ACK
+        last_acked_seq   = -1  # seq последнего подтверждённого блока
 
         # ── шаг 2: принимаем DATA-блоки ──────────────────────────────────────
         while not cp.is_complete:
-            missing = cp.missing_blocks
+            missing      = cp.missing_blocks
+            expected_seq = missing[0]
+
             logger.info(
-                "Принято %d/%d блоков. Жду следующий (seq=%d)...",
-                len(cp.received), cp.total_blocks, missing[0]
+                "Принято %d/%d блоков. Жду seq=%d...",
+                len(cp.received), cp.total_blocks, expected_seq
             )
 
-            frame = self._wait_for_frame(
-                expected_type = FrameType.DATA,
-                file_id       = cp.file_id,
-                timeout       = BLOCK_WAIT_TIMEOUT,
-            )
+            frame = self._wait_for_data(cp.file_id, timeout=BLOCK_WAIT_TIMEOUT)
 
             if frame is None:
-                logger.error(
-                    "Таймаут ожидания блока seq=%d. "
-                    "Отправитель, вероятно, завис. Прерываем.",
-                    missing[0]
-                )
-                self._send_abort(cp.file_id, f"Таймаут блока seq={missing[0]}")
+                logger.error("Таймаут ожидания блока seq=%d.", expected_seq)
+                self._send_abort(cp.file_id, f"Таймаут блока seq={expected_seq}")
                 return None
 
             seq = frame.seq
 
-            # Дубликат — уже получили этот блок
+            # Дубликат
             if seq in cp.received:
-                logger.debug("Дубликат блока seq=%d, повторно подтверждаем.", seq)
+                logger.debug("Дубликат seq=%d — подтверждаем повторно.", seq)
                 self._t.send(make_ack_frame(cp.file_id, seq).encode())
+                blocks_since_ack = 0
                 continue
 
-            # Декодируем payload
+            # Неожиданный блок — пропуск
+            if seq != expected_seq:
+                logger.warning(
+                    "Получен seq=%d, ожидали seq=%d → NACK[%d].",
+                    seq, expected_seq, expected_seq
+                )
+                self._t.send(make_nack_frame(cp.file_id, expected_seq).encode())
+                blocks_since_ack = 0
+                continue
+
+            # Декодируем
             try:
                 raw = decode_data_payload(frame.payload)
             except Exception as e:
-                logger.warning("Ошибка декодирования блока seq=%d: %s — NACK.", seq, e)
+                logger.warning("Ошибка декодирования seq=%d: %s → NACK.", seq, e)
                 self._t.send(make_nack_frame(cp.file_id, seq).encode())
+                blocks_since_ack = 0
                 continue
 
-            # Сохраняем блок и обновляем чекпойнт
+            # Сохраняем блок
             block_buf[seq] = raw
             self._save_partial_block(cp, seq, raw)
             cp.mark_received(seq)
+            blocks_since_ack += 1
+            last_acked_seq    = seq
+            logger.debug("Блок seq=%d принят (%d байт).", seq, len(raw))
 
-            self._t.send(make_ack_frame(cp.file_id, seq).encode())
-            logger.debug("ACK → seq=%d ✓", seq)
+            # Шлём ACK если накопили window_size блоков или получили последний
+            if blocks_since_ack >= window_size or cp.is_complete:
+                logger.debug(
+                    "ACK → seq=%d (принято %d блоков в окне).",
+                    last_acked_seq, blocks_since_ack
+                )
+                self._t.send(make_ack_frame(cp.file_id, last_acked_seq).encode())
+                blocks_since_ack = 0
 
-        # ── шаг 3: сборка файла ───────────────────────────────────────────────
+        # ── шаг 3: сборка и проверка ─────────────────────────────────────────
         logger.info("Все блоки получены. Собираем файл...")
         out_path = self._assemble_file(cp, block_buf)
 
-        # ── шаг 4: проверка sha256 ────────────────────────────────────────────
         actual_sha256 = _file_sha256(out_path)
         if actual_sha256 != cp.sha256:
             logger.error(
-                "SHA256 не совпадает! Ожидали %s, получили %s. Файл повреждён.",
+                "SHA256 не совпадает! Ожидали %s, получили %s.",
                 cp.sha256, actual_sha256
             )
             self._send_abort(cp.file_id, "SHA256 mismatch после сборки")
             return None
 
-        # ── шаг 5: DONE ───────────────────────────────────────────────────────
         self._t.send(make_done_frame(cp.file_id, actual_sha256).encode())
-        logger.info("✓ Файл принят и проверен: %s", out_path)
+        logger.info("Файл принят и проверен: %s", out_path)
 
-        # Чистим временные файлы блоков
         self._cleanup_partial_blocks(cp)
         cp.delete()
-
         return out_path
 
     # ── ожидание META ─────────────────────────────────────────────────────────
 
-    def _wait_for_meta(self) -> tuple[Optional[Frame], Optional[ReceiverCheckpoint]]:
-        """
-        Ждём META. Если есть незавершённый чекпойнт — возвращаем его
-        вместо ожидания новой META (режим восстановления).
-        """
-        # Проверяем существующие чекпойнты в ckpt_dir
+    def _wait_for_meta(
+        self,
+    ) -> tuple[Optional[Frame], Optional[ReceiverCheckpoint]]:
         for ckpt_path in self._ckpt_dir.glob("*.receiver.ckpt.json"):
             cp = ReceiverCheckpoint.load(ckpt_path)
             if cp and not cp.is_complete:
                 logger.info(
-                    "Найден незавершённый чекпойнт: %s (%d/%d блоков). Продолжаем.",
+                    "Найден незавершённый чекпойнт: %s (%d/%d). Продолжаем.",
                     cp.filename, len(cp.received), cp.total_blocks
                 )
-                # Создаём фиктивный META-frame для совместимости возвращаемого типа
-                fake_meta = Frame(
-                    type    = FrameType.META,
-                    file_id = cp.file_id,
-                    seq     = 0,
-                    total   = cp.total_blocks,
-                    payload = "",  # не нужен — уже всё в cp
-                )
-                return fake_meta, cp
+                fake = Frame(FrameType.META, cp.file_id, 0, cp.total_blocks, "")
+                return fake, cp
 
-        # Ждём настоящую META из канала
         deadline = time.monotonic() + META_WAIT_TIMEOUT
         while time.monotonic() < deadline:
             for raw in self._t.poll_new_messages():
                 frame = self._try_decode_any(raw)
-                if frame is None:
-                    continue
-                if frame.type == FrameType.META:
-                    cp = self._init_checkpoint(frame)
-                    return frame, cp
+                if frame and frame.type == FrameType.META:
+                    return frame, self._init_checkpoint(frame)
             time.sleep(POLL_INTERVAL)
-
         return None, None
 
     def _init_checkpoint(self, meta: Frame) -> ReceiverCheckpoint:
-        meta_data = json.loads(meta.payload)
+        data = json.loads(meta.payload)
         ckpt_path = self._ckpt_dir / f"{meta.file_id}.receiver.ckpt.json"
         cp = ReceiverCheckpoint(ckpt_path)
         cp.file_id      = meta.file_id
-        cp.filename     = meta_data["name"]
-        cp.sha256       = meta_data["sha256"]
-        cp.total_blocks = meta_data["blocks"]
-        cp.file_size    = meta_data.get("size", 0)
+        cp.filename     = data["name"]
+        cp.sha256       = data["sha256"]
+        cp.total_blocks = data["blocks"]
+        cp.file_size    = data.get("size", 0)
         cp.out_dir      = str(self._out_dir)
         cp.save()
         return cp
 
-    # ── ожидание кадра ───────────────────────────────────────────────────────
+    # ── ожидание DATA-кадра ───────────────────────────────────────────────────
 
-    def _wait_for_frame(
-        self,
-        expected_type: FrameType,
-        file_id: str,
-        timeout: float,
-    ) -> Optional[Frame]:
+    def _wait_for_data(self, file_id: str, timeout: float) -> Optional[Frame]:
+        """
+        Вернуть следующий DATA-кадр от отправителя.
+
+        Сначала проверяем буфер _data_buf — poll может вернуть несколько
+        блоков за раз (отправитель шлёт всё окно подряд), и мы должны
+        обработать их все, а не только первый.
+        """
+        # Сначала — из буфера
+        if self._data_buf:
+            return self._data_buf.pop(0)
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for raw in self._t.poll_new_messages():
@@ -214,11 +215,18 @@ class FileReceiver:
                     continue
                 if frame.file_id != file_id:
                     continue
-                if frame.type == expected_type:
-                    return frame
-                if frame.type == FrameType.ABORT:
+                if frame.type == FrameType.DATA:
+                    # Первый кадр возвращаем сразу, остальные — в буфер
+                    if not self._data_buf:
+                        # Это первый — продолжаем читать остальные в буфер
+                        self._data_buf.append(frame)
+                    else:
+                        self._data_buf.append(frame)
+                elif frame.type == FrameType.ABORT:
                     logger.error("ABORT от отправителя: %s", frame.payload)
                     return None
+            if self._data_buf:
+                return self._data_buf.pop(0)
             time.sleep(POLL_INTERVAL)
         return None
 
@@ -232,12 +240,12 @@ class FileReceiver:
 
     def _restore_partial_blocks(self, cp: ReceiverCheckpoint) -> dict[int, bytes]:
         buf: dict[int, bytes] = {}
-        for seq in cp.received:
+        for seq in list(cp.received):
             p = self._partial_block_path(cp, seq)
             if p.exists():
                 buf[seq] = p.read_bytes()
             else:
-                logger.warning("Блок seq=%d помечен как принятый, но файл отсутствует. Сбрасываем.", seq)
+                logger.warning("Блок seq=%d в чекпойнте, файл отсутствует — сброс.", seq)
                 cp.received.discard(seq)
         return buf
 
@@ -247,18 +255,17 @@ class FileReceiver:
             if p.exists():
                 p.unlink()
 
-    # ── сборка финального файла ──────────────────────────────────────────────
+    # ── сборка файла ─────────────────────────────────────────────────────────
 
-    def _assemble_file(self, cp: ReceiverCheckpoint, block_buf: dict[int, bytes]) -> Path:
+    def _assemble_file(
+        self, cp: ReceiverCheckpoint, block_buf: dict[int, bytes]
+    ) -> Path:
         out_path = self._out_dir / cp.filename
-        # Если файл уже существует — добавим суффикс, чтобы не перезаписать
         if out_path.exists():
             out_path = self._out_dir / f"{cp.file_id}_{cp.filename}"
-
         with open(out_path, "wb") as f:
             for seq in range(cp.total_blocks):
                 f.write(block_buf[seq])
-
         logger.info("Файл записан: %s (%d байт)", out_path, out_path.stat().st_size)
         return out_path
 
@@ -268,7 +275,7 @@ class FileReceiver:
         try:
             return Frame.decode(raw)
         except FrameDecodeError as e:
-            logger.warning("Битый кадр (игнорируем): %s", e)
+            logger.warning("Битый кадр: %s", e)
             return None
 
     def _send_abort(self, file_id: str, reason: str):
