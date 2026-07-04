@@ -37,7 +37,7 @@ from typing import Optional
 
 # ── константы ────────────────────────────────────────────────────────────────
 
-FRAME_PREFIX = "##FT|"
+FRAME_PREFIX = "##FT"
 FRAME_SUFFIX = "##"
 PROTOCOL_VERSION = "v1"
 
@@ -93,15 +93,21 @@ class Frame:
         body_for_crc = f"{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{self.payload}"
         crc = _crc32hex(body_for_crc)
 
+        # Получаем ключ шифрования из config (если задан)
+        from .. import config as _cfg
+        key = _cfg.FRAME_KEY.encode("utf-8") if getattr(_cfg, "FRAME_KEY", "") else b""
+
         if self.type == FrameType.DATA:
-            # Только заголовок в base64, payload оставляем как есть
+            # Заголовок: XOR → base64. Payload (уже base64) — как есть.
             header_plain = f"{PROTOCOL_VERSION}|{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{crc}"
-            header_b64   = base64.b64encode(header_plain.encode("utf-8")).decode("ascii")
+            header_enc   = _xor_cipher(header_plain.encode("utf-8"), key)
+            header_b64   = base64.b64encode(header_enc).decode("ascii")
             text = f"{FRAME_PREFIX}{header_b64}|{self.payload}{FRAME_SUFFIX}"
         else:
-            # Весь inner в base64 — payload полностью скрыт
+            # Весь inner: XOR → base64 — имя файла, SHA256 и прочее скрыто.
             inner_plain = f"{PROTOCOL_VERSION}|{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{self.payload}|{crc}"
-            inner_b64   = base64.b64encode(inner_plain.encode("utf-8")).decode("ascii")
+            inner_enc   = _xor_cipher(inner_plain.encode("utf-8"), key)
+            inner_b64   = base64.b64encode(inner_enc).decode("ascii")
             text = f"{FRAME_PREFIX}{inner_b64}{FRAME_SUFFIX}"
 
         if len(text) > MESSAGE_MAX_LEN:
@@ -138,9 +144,14 @@ class Frame:
 
         inner = text[len(FRAME_PREFIX):-len(FRAME_SUFFIX)]
 
+        # Получаем ключ шифрования из config (если задан)
+        from .. import config as _cfg
+        key = _cfg.FRAME_KEY.encode("utf-8") if getattr(_cfg, "FRAME_KEY", "") else b""
+
         # Пробуем декодировать весь inner как base64 (формат не-DATA)
         try:
-            inner_plain = base64.b64decode(inner.encode("ascii")).decode("utf-8")
+            inner_dec   = base64.b64decode(inner.encode("ascii"))
+            inner_plain = _xor_cipher(inner_dec, key).decode("utf-8")
             parts = inner_plain.split("|")
             # Формат: v1|TYPE|file_id|seq|total|payload|crc — минимум 7 полей
             # payload сам может содержать "|" (JSON META)
@@ -187,7 +198,8 @@ class Frame:
         payload    = inner[sep + 1:]
 
         try:
-            header_plain = base64.b64decode(header_b64.encode("ascii")).decode("utf-8")
+            header_dec   = base64.b64decode(header_b64.encode("ascii"))
+            header_plain = _xor_cipher(header_dec, key).decode("utf-8")
         except Exception:
             raise FrameDecodeError(f"Ошибка декодирования заголовка DATA: {header_b64[:20]!r}")
 
@@ -231,6 +243,17 @@ class FrameDecodeError(Exception):
 def _crc32hex(s: str) -> str:
     """CRC32 строки в UTF-8, результат — 8-символьный lowercase hex."""
     return format(zlib.crc32(s.encode("utf-8")) & 0xFFFFFFFF, "08x")
+
+
+def _xor_cipher(data: bytes, key: bytes) -> bytes:
+    """
+    XOR-шифрование с повторяющимся ключом.
+    Применяется к заголовку кадра перед base64-кодированием.
+    Без знания ключа декодированный base64 даёт бессмысленный набор байт.
+    """
+    if not key:
+        return data
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
 
 
 def make_file_id() -> str:
