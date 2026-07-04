@@ -20,7 +20,7 @@ from onix_ft.transport.selenium_driver import OnixSeleniumTransport
 from onix_ft.core.receiver import FileReceiver
 
 logging.basicConfig(
-    level   = logging.DEBUG,
+    level   = logging.INFO,
     format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt = "%H:%M:%S",
 )
