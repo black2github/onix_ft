@@ -280,9 +280,13 @@ class FileReceiver:
 
     def _extract_archive(self, zip_path: Path) -> Path:
         """
-        Распаковать автоматически созданный ZIP-архив каталога.
+        Распаковать автоматически созданный ZIP-архив файла или каталога.
         После успешной распаковки архив удаляется.
-        Возвращает путь к распакованному каталогу.
+
+        Для одиночного файла (archive.md.zip):
+            → распаковывает file.md, возвращает путь к file.md
+        Для каталога (my_docs.zip содержит my_docs/...):
+            → распаковывает my_docs/, возвращает путь к my_docs/
         """
         extract_to = zip_path.parent
         logger.info("Распаковка архива %s в %s...", zip_path.name, extract_to)
@@ -292,17 +296,28 @@ class FileReceiver:
                 bad = zf.testzip()
                 if bad:
                     logger.error("Архив повреждён, первый плохой файл: %s", bad)
-                    return zip_path  # возвращаем архив как есть
+                    return zip_path
+                names = zf.namelist()
                 zf.extractall(extract_to)
-            # Определяем что распаковалось — имя каталога без .zip
-            extracted_name = zip_path.stem
-            extracted_path = extract_to / extracted_name
+
             zip_path.unlink()
+
+            # Определяем что распаковалось:
+            # Если в архиве один файл в корне — возвращаем его путь.
+            # Если каталог — возвращаем путь к каталогу.
+            top_level = {Path(n).parts[0] for n in names}
+            if len(top_level) == 1:
+                extracted_path = extract_to / list(top_level)[0]
+            else:
+                # Несколько элементов в корне — возвращаем директорию распаковки
+                extracted_path = extract_to
+
             logger.info("Распаковано: %s", extracted_path)
             return extracted_path
+
         except Exception as e:
             logger.error("Ошибка распаковки архива: %s", e)
-            return zip_path  # возвращаем архив как есть при ошибке
+            return zip_path
 
     def _try_decode_any(self, raw: str) -> Optional[Frame]:
         try:
