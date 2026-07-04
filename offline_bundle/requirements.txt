@@ -1,0 +1,2 @@
+selenium==4.45.0
+pyperclip==1.9.0
