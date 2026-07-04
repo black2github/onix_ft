@@ -185,13 +185,30 @@ def decode_data_payload(b64_str: str) -> bytes:
 
 # ── фабрики кадров ───────────────────────────────────────────────────────────
 
-def make_meta_frame(file_id: str, path: Path, total_blocks: int, sha256: str) -> Frame:
-    payload = json.dumps({
+def make_meta_frame(
+    file_id:      str,
+    path:         Path,
+    total_blocks: int,
+    sha256:       str,
+    auto_extract: bool = False,
+) -> Frame:
+    """
+    Создать META-кадр.
+
+    auto_extract=True означает что файл является временным ZIP-архивом,
+    созданным автоматически из каталога на стороне отправителя.
+    Получатель должен распаковать его и удалить архив после распаковки.
+    Для обычных файлов (включая ZIP отправленные вручную) — False.
+    """
+    meta = {
         "name":   path.name,
         "size":   path.stat().st_size,
         "sha256": sha256,
         "blocks": total_blocks,
-    }, ensure_ascii=False, separators=(",", ":"))
+    }
+    if auto_extract:
+        meta["auto_extract"] = True
+    payload = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
     return Frame(FrameType.META, file_id, seq=0, total=total_blocks, payload=payload)
 
 

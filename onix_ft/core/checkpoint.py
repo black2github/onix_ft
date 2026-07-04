@@ -25,6 +25,8 @@ class SenderCheckpoint:
         self.total_blocks:  int = 0
         self.last_acked:    int = -1   # последний подтверждённый блок (-1 = META не подтверждена)
         self.meta_acked:    bool = False
+        # True если передаётся автоматически созданный ZIP-архив каталога
+        self.auto_extract:  bool = False
 
     # ── персистентность ──────────────────────────────────────────────────────
 
@@ -37,6 +39,7 @@ class SenderCheckpoint:
             "total_blocks": self.total_blocks,
             "last_acked":   self.last_acked,
             "meta_acked":   self.meta_acked,
+            "auto_extract": self.auto_extract,
         }
         self._path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -55,6 +58,7 @@ class SenderCheckpoint:
             cp.total_blocks = data["total_blocks"]
             cp.last_acked   = data["last_acked"]
             cp.meta_acked   = data.get("meta_acked", False)
+            cp.auto_extract = data.get("auto_extract", False)
             return cp
         except Exception:
             return None
@@ -96,6 +100,9 @@ class ReceiverCheckpoint:
         self.file_size:    int       = 0
         self.received:     set[int]  = set()   # полученные и проверенные блоки
         self.out_dir:      str       = ""
+        # True если файл является автоматически созданным ZIP-архивом каталога.
+        # Получатель должен распаковать его после приёма.
+        self.auto_extract: bool      = False
 
     # ── персистентность ──────────────────────────────────────────────────────
 
@@ -109,6 +116,7 @@ class ReceiverCheckpoint:
             "file_size":    self.file_size,
             "received":     sorted(self.received),
             "out_dir":      self.out_dir,
+            "auto_extract": self.auto_extract,
         }
         self._path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -128,6 +136,7 @@ class ReceiverCheckpoint:
             cp.file_size    = data.get("file_size", 0)
             cp.received     = set(data.get("received", []))
             cp.out_dir      = data.get("out_dir", "")
+            cp.auto_extract = data.get("auto_extract", False)
             return cp
         except Exception:
             return None

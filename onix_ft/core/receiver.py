@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import zipfile
 import json
 import logging
 import time
@@ -152,6 +153,11 @@ class FileReceiver:
         self._t.send(make_done_frame(cp.file_id, actual_sha256).encode())
         logger.info("Файл принят и проверен: %s", out_path)
 
+        # Если файл является автоматически созданным архивом каталога —
+        # распаковываем и удаляем архив. Обычные ZIP-файлы не трогаем.
+        if cp.auto_extract:
+            out_path = self._extract_archive(out_path)
+
         self._cleanup_partial_blocks(cp)
         cp.delete()
         return out_path
@@ -190,6 +196,7 @@ class FileReceiver:
         cp.total_blocks = data["blocks"]
         cp.file_size    = data.get("size", 0)
         cp.out_dir      = str(self._out_dir)
+        cp.auto_extract = data.get("auto_extract", False)
         cp.save()
         return cp
 
@@ -270,6 +277,32 @@ class FileReceiver:
         return out_path
 
     # ── утилиты ──────────────────────────────────────────────────────────────
+
+    def _extract_archive(self, zip_path: Path) -> Path:
+        """
+        Распаковать автоматически созданный ZIP-архив каталога.
+        После успешной распаковки архив удаляется.
+        Возвращает путь к распакованному каталогу.
+        """
+        extract_to = zip_path.parent
+        logger.info("Распаковка архива %s в %s...", zip_path.name, extract_to)
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                # Проверяем целостность архива перед распаковкой
+                bad = zf.testzip()
+                if bad:
+                    logger.error("Архив повреждён, первый плохой файл: %s", bad)
+                    return zip_path  # возвращаем архив как есть
+                zf.extractall(extract_to)
+            # Определяем что распаковалось — имя каталога без .zip
+            extracted_name = zip_path.stem
+            extracted_path = extract_to / extracted_name
+            zip_path.unlink()
+            logger.info("Распаковано: %s", extracted_path)
+            return extracted_path
+        except Exception as e:
+            logger.error("Ошибка распаковки архива: %s", e)
+            return zip_path  # возвращаем архив как есть при ошибке
 
     def _try_decode_any(self, raw: str) -> Optional[Frame]:
         try:

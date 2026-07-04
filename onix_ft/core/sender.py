@@ -46,9 +46,15 @@ POLL_INTERVAL: float = 2.0    # секунд между опросами transpo
 
 class FileSender:
 
-    def __init__(self, transport: BaseTransport, ckpt_dir: Optional[Path] = None):
-        self._t        = transport
-        self._ckpt_dir = ckpt_dir or Path(".")
+    def __init__(
+        self,
+        transport:    BaseTransport,
+        ckpt_dir:     Optional[Path] = None,
+        auto_extract: bool = False,
+    ):
+        self._t           = transport
+        self._ckpt_dir    = ckpt_dir or Path(".")
+        self._auto_extract = auto_extract
         # Буфер входящих кадров: кадры, пришедшие «не вовремя», чтобы не потерять.
         self._frame_buf: list[Frame] = []
         # Счётчик блоков, переданных с момента последней очистки чата.
@@ -91,6 +97,7 @@ class FileSender:
             cp.source_path  = str(source_path)
             cp.sha256       = sha256
             cp.total_blocks = len(blocks)
+            cp.auto_extract = self._auto_extract
             cp.save()
 
         # Разбиваем файл на блоки (нужны всегда — даже при восстановлении).
@@ -107,7 +114,8 @@ class FileSender:
         if not cp.meta_acked:
             logger.info("Отправка META...")
             meta_frame = make_meta_frame(
-                cp.file_id, source_path, cp.total_blocks, cp.sha256
+                cp.file_id, source_path, cp.total_blocks, cp.sha256,
+                auto_extract=cp.auto_extract,
             )
             ok = self._send_and_wait_ack(
                 frame        = meta_frame,

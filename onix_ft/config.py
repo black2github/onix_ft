@@ -50,7 +50,7 @@ SEND_BTN_TIMEOUT: float = 5.0
 SEND_DELAY: float = 0.8
 
 # Ожидание готовности страницы при старте (включая время ручного логина).
-PAGE_READY_TIMEOUT: float = 120.0
+PAGE_READY_TIMEOUT: float = 300.0
 
 # Пауза после обнаружения поля ввода — даём Onix время на lazy-loading
 # истории чата. За это время все старые сообщения появятся в DOM и будут
