@@ -37,16 +37,18 @@ from typing import Optional
 
 # ── константы ────────────────────────────────────────────────────────────────
 
-FRAME_PREFIX = "##FT|v1|"
+FRAME_PREFIX = "##FT|"
 FRAME_SUFFIX = "##"
 PROTOCOL_VERSION = "v1"
 
 # Размер одного DATA-блока в байтах исходных данных.
-# base64 раздует его примерно в 4/3, то есть ~2700 байт → ~3600 символов b64.
-# Оставляем запас на заголовок кадра (~120 символов) из лимита 4000 символов сообщения.
-CHUNK_BYTES = 3036
+# Формат кадра: ##FT|<base64(заголовок|crc)>|<base64(данные)>##
+# Заголовок в base64 занимает ~48 символов, маркеры ##FT| и ## — 8 символов.
+# Доступно для payload: 4095 - 48 - 8 = 4039 символов base64.
+# 4039 / 4 * 3 = 3029, округляем до кратного 3: CHUNK_BYTES = 3027.
+CHUNK_BYTES = 3027
 
-# Лимит символов в одном сообщении Onix (с небольшим запасом).
+# Лимит символов в одном сообщении Onix (измерено экспериментально).
 MESSAGE_MAX_LEN = 4095
 
 
@@ -72,10 +74,36 @@ class Frame:
     # ── сериализация ─────────────────────────────────────────────────────────
 
     def encode(self) -> str:
-        """Превратить кадр в строку для отправки в чат."""
-        body = f"{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{self.payload}"
-        crc  = _crc32hex(body)
-        text = f"{FRAME_PREFIX}{body}|{crc}{FRAME_SUFFIX}"
+        """
+        Превратить кадр в строку для отправки в чат.
+
+        Стратегия кодирования зависит от типа кадра:
+
+        DATA — payload уже является base64-строкой бинарных данных, поэтому
+        кодируем только заголовок, payload оставляем как есть:
+            ##FT|<base64(v1|DATA|file_id|seq|total|crc)>|<base64_payload>##
+        Двойное base64-кодирование payload увеличило бы размер на ~33%
+        и потребовало бы уменьшения CHUNK_BYTES на 25% — неприемлемая потеря.
+
+        Все остальные типы (META, ACK, NACK, DONE, ABORT) — payload небольшой,
+        кодируем весь inner целиком:
+            ##FT|<base64(v1|TYPE|file_id|seq|total|payload|crc)>##
+        Имя файла, SHA256, размер и прочие метаданные полностью скрыты.
+        """
+        body_for_crc = f"{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{self.payload}"
+        crc = _crc32hex(body_for_crc)
+
+        if self.type == FrameType.DATA:
+            # Только заголовок в base64, payload оставляем как есть
+            header_plain = f"{PROTOCOL_VERSION}|{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{crc}"
+            header_b64   = base64.b64encode(header_plain.encode("utf-8")).decode("ascii")
+            text = f"{FRAME_PREFIX}{header_b64}|{self.payload}{FRAME_SUFFIX}"
+        else:
+            # Весь inner в base64 — payload полностью скрыт
+            inner_plain = f"{PROTOCOL_VERSION}|{self.type.value}|{self.file_id}|{self.seq}|{self.total}|{self.payload}|{crc}"
+            inner_b64   = base64.b64encode(inner_plain.encode("utf-8")).decode("ascii")
+            text = f"{FRAME_PREFIX}{inner_b64}{FRAME_SUFFIX}"
+
         if len(text) > MESSAGE_MAX_LEN:
             raise ValueError(
                 f"Кадр {self.type} seq={self.seq} превышает лимит сообщения: "
@@ -90,30 +118,90 @@ class Frame:
         """
         Распарсить строку сообщения чата.
         Возвращает Frame или None, если строка — не наш кадр.
-        Бросает FrameDecodeError при битом кадре (маркеры есть, но внутри ошибка).
+        Бросает FrameDecodeError при битом кадре.
+
+        Два формата в зависимости от типа кадра:
+
+        DATA:  ##FT|<base64(v1|DATA|file_id|seq|total|crc)>|<payload>##
+               Содержит "|" после первого base64-сегмента.
+
+        Прочие: ##FT|<base64(v1|TYPE|file_id|seq|total|payload|crc)>##
+               Весь inner — один base64-блок без дополнительного "|".
+
+        Различаем форматы: пробуем декодировать весь inner как base64.
+        Если успешно и внутри 7 полей — это не-DATA формат.
+        Если нет (содержит "|") — это DATA формат.
         """
         text = text.strip()
         if not (text.startswith(FRAME_PREFIX) and text.endswith(FRAME_SUFFIX)):
-            return None  # обычное сообщение чата — просто игнорируем
+            return None  # обычное сообщение чата — игнорируем
 
         inner = text[len(FRAME_PREFIX):-len(FRAME_SUFFIX)]
-        parts = inner.split("|")
 
-        # Минимум 6 полей: type, file_id, seq, total, payload, crc
-        # payload сам может содержать "|" (JSON), поэтому берём последние 5 + всё остальное как payload
-        if len(parts) < 6:
-            raise FrameDecodeError(f"Слишком мало полей в кадре: {inner!r}")
+        # Пробуем декодировать весь inner как base64 (формат не-DATA)
+        try:
+            inner_plain = base64.b64decode(inner.encode("ascii")).decode("utf-8")
+            parts = inner_plain.split("|")
+            # Формат: v1|TYPE|file_id|seq|total|payload|crc — минимум 7 полей
+            # payload сам может содержать "|" (JSON META)
+            if len(parts) >= 7:
+                version   = parts[0]
+                ftype_str = parts[1]
+                file_id   = parts[2]
+                seq_str   = parts[3]
+                total_str = parts[4]
+                crc_received = parts[-1]
+                payload   = "|".join(parts[5:-1])
 
-        # CRC всегда последний элемент (8 hex-символов)
-        crc_received = parts[-1]
-        # payload — всё между (type|file_id|seq|total| и |crc)
-        # то есть parts[0..3] + "|".join(parts[4:-1])
-        ftype_str, file_id, seq_str, total_str = parts[0], parts[1], parts[2], parts[3]
-        payload = "|".join(parts[4:-1])
+                if version != PROTOCOL_VERSION:
+                    raise FrameDecodeError(
+                        f"Неподдерживаемая версия: {version!r}"
+                    )
+                body_for_crc = f"{ftype_str}|{file_id}|{seq_str}|{total_str}|{payload}"
+                crc_expected = _crc32hex(body_for_crc)
+                if crc_received != crc_expected:
+                    raise FrameDecodeError(
+                        f"CRC mismatch: ожидали {crc_expected}, получили {crc_received}"
+                    )
+                try:
+                    ftype = FrameType(ftype_str)
+                except ValueError:
+                    raise FrameDecodeError(f"Неизвестный тип: {ftype_str!r}")
+                try:
+                    seq   = int(seq_str)
+                    total = int(total_str)
+                except ValueError:
+                    raise FrameDecodeError(f"Нечисловые seq/total")
+                return Frame(type=ftype, file_id=file_id, seq=seq, total=total, payload=payload)
+        except FrameDecodeError:
+            raise
+        except Exception:
+            pass  # не base64 или меньше 7 полей — пробуем DATA-формат
+
+        # DATA-формат: ##FT|<base64(заголовок)>|<payload>##
+        sep = inner.find("|")
+        if sep == -1:
+            raise FrameDecodeError(f"Не удалось распознать формат кадра: {inner[:40]!r}")
+
+        header_b64 = inner[:sep]
+        payload    = inner[sep + 1:]
+
+        try:
+            header_plain = base64.b64decode(header_b64.encode("ascii")).decode("utf-8")
+        except Exception:
+            raise FrameDecodeError(f"Ошибка декодирования заголовка DATA: {header_b64[:20]!r}")
+
+        hparts = header_plain.split("|")
+        if len(hparts) != 6:
+            raise FrameDecodeError(f"Неверная структура заголовка DATA: {header_plain!r}")
+
+        version, ftype_str, file_id, seq_str, total_str, crc_received = hparts
+
+        if version != PROTOCOL_VERSION:
+            raise FrameDecodeError(f"Неподдерживаемая версия: {version!r}")
 
         body_for_crc = f"{ftype_str}|{file_id}|{seq_str}|{total_str}|{payload}"
         crc_expected = _crc32hex(body_for_crc)
-
         if crc_received != crc_expected:
             raise FrameDecodeError(
                 f"CRC mismatch: ожидали {crc_expected}, получили {crc_received}"
@@ -122,13 +210,13 @@ class Frame:
         try:
             ftype = FrameType(ftype_str)
         except ValueError:
-            raise FrameDecodeError(f"Неизвестный тип кадра: {ftype_str!r}")
+            raise FrameDecodeError(f"Неизвестный тип: {ftype_str!r}")
 
         try:
             seq   = int(seq_str)
             total = int(total_str)
         except ValueError:
-            raise FrameDecodeError(f"Нечисловые seq/total: {seq_str!r}/{total_str!r}")
+            raise FrameDecodeError(f"Нечисловые seq/total")
 
         return Frame(type=ftype, file_id=file_id, seq=seq, total=total, payload=payload)
 
