@@ -41,15 +41,25 @@ FRAME_PREFIX = "##FT"
 FRAME_SUFFIX = "##"
 PROTOCOL_VERSION = "v1"
 
-# Размер одного DATA-блока в байтах исходных данных.
-# Формат кадра: ##FT|<base64(заголовок|crc)>|<base64(данные)>##
-# Заголовок в base64 занимает ~48 символов, маркеры ##FT| и ## — 8 символов.
-# Доступно для payload: 4095 - 48 - 8 = 4039 символов base64.
-# 4039 / 4 * 3 = 3029, округляем до кратного 3: CHUNK_BYTES = 3027.
-CHUNK_BYTES = 3027
+# CHUNK_BYTES и MESSAGE_MAX_LEN вынесены в config.py.
+# Значения подтягиваются при первом обращении к encode()/split_file().
+def _get_chunk_bytes() -> int:
+    try:
+        from .. import config
+        return config.CHUNK_BYTES
+    except Exception:
+        return 3027
 
-# Лимит символов в одном сообщении Onix (измерено экспериментально).
-MESSAGE_MAX_LEN = 4095
+def _get_message_max_len() -> int:
+    try:
+        from .. import config
+        return config.MESSAGE_MAX_LEN
+    except Exception:
+        return 4095
+
+# Для обратной совместимости и использования в split_file()
+CHUNK_BYTES = _get_chunk_bytes()
+MESSAGE_MAX_LEN = _get_message_max_len()
 
 
 class FrameType(str, Enum):
@@ -110,10 +120,11 @@ class Frame:
             inner_b64   = base64.b64encode(inner_enc).decode("ascii")
             text = f"{FRAME_PREFIX}{inner_b64}{FRAME_SUFFIX}"
 
-        if len(text) > MESSAGE_MAX_LEN:
+        max_len = _get_message_max_len()
+        if len(text) > max_len:
             raise ValueError(
                 f"Кадр {self.type} seq={self.seq} превышает лимит сообщения: "
-                f"{len(text)} > {MESSAGE_MAX_LEN}"
+                f"{len(text)} > {max_len}"
             )
         return text
 
@@ -273,11 +284,12 @@ def file_sha256(path: Path) -> str:
 
 
 def split_file(path: Path) -> list[bytes]:
-    """Разбить файл на блоки по CHUNK_BYTES байт."""
+    """Разбить файл на блоки по CHUNK_BYTES байт (из config.py)."""
+    chunk_size = _get_chunk_bytes()
     blocks = []
     with open(path, "rb") as f:
         while True:
-            chunk = f.read(CHUNK_BYTES)
+            chunk = f.read(chunk_size)
             if not chunk:
                 break
             blocks.append(chunk)

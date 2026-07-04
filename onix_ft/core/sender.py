@@ -8,7 +8,7 @@
        а. Отправить W блоков подряд без ожидания ACK между ними.
        б. Ждать ACK[last] от получателя (подтверждение всего окна).
        в. При NACK[N] — откатиться к блоку N и повторить окно с него.
-       г. При таймауте — повторить всё окно (до MAX_RETRIES раз).
+       г. При таймауте — повторить всё окно (до config.MAX_RETRIES раз).
        д. После каждых CLEAR_CHAT_EVERY_N_BLOCKS блоков — очистить чат.
   4. Получить DONE от получателя, сверить sha256.
   5. Удалить чекпойнт.
@@ -37,9 +37,7 @@ logger = logging.getLogger("onix_ft.sender")
 
 # ── настройки ────────────────────────────────────────────────────────────────
 
-MAX_RETRIES:   int   = 5      # сколько раз повторить окно при NACK/таймауте
-ACK_TIMEOUT:   float = 120.0  # секунд ждать ACK на всё окно
-POLL_INTERVAL: float = 2.0    # секунд между опросами transport.poll_new_messages()
+# Настройки вынесены в config.py (config.MAX_RETRIES, config.ACK_TIMEOUT, config.POLL_INTERVAL).
 
 
 # ── отправитель ──────────────────────────────────────────────────────────────
@@ -145,7 +143,7 @@ class FileSender:
             if not ok:
                 self._send_abort(
                     cp.file_id,
-                    f"Окно [{win_start}..{win_end}] не подтверждено после {MAX_RETRIES} попыток"
+                    f"Окно [{win_start}..{win_end}] не подтверждено после {config.MAX_RETRIES} попыток"
                 )
                 return False
 
@@ -156,7 +154,7 @@ class FileSender:
         done_frame = self._wait_for_frame(
             expected_type = FrameType.DONE,
             file_id       = cp.file_id,
-            timeout       = ACK_TIMEOUT,
+            timeout       = config.ACK_TIMEOUT,
         )
         if done_frame is None:
             logger.error("DONE не получен — таймаут.")
@@ -197,10 +195,10 @@ class FileSender:
             win_start, win_end, cp.total_blocks
         )
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, config.MAX_RETRIES + 1):
             if attempt > 1:
                 logger.warning("  Повтор окна [%d..%d], попытка %d/%d...",
-                               win_start, win_end, attempt, MAX_RETRIES)
+                               win_start, win_end, attempt, config.MAX_RETRIES)
 
             # Отправляем все блоки окна подряд без ожидания ACK
             send_from = win_start if attempt == 1 else win_start
@@ -216,7 +214,7 @@ class FileSender:
             response = self._wait_for_frame(
                 expected_type = FrameType.ACK,
                 file_id       = file_id,
-                timeout       = ACK_TIMEOUT,
+                timeout       = config.ACK_TIMEOUT,
                 expected_seq  = win_end,
                 also_accept   = FrameType.NACK,
             )
@@ -260,7 +258,7 @@ class FileSender:
         # Все попытки исчерпаны
         logger.error(
             "Окно [%d..%d] не подтверждено после %d попыток.",
-            win_start, win_end, MAX_RETRIES
+            win_start, win_end, config.MAX_RETRIES
         )
         return False, win_start
 
@@ -292,16 +290,16 @@ class FileSender:
         is_meta: bool = False,
     ) -> bool:
         """Отправить одиночный кадр (META), ждать ACK. True = успех."""
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, config.MAX_RETRIES + 1):
             if attempt > 1:
-                logger.warning("  Повтор %d/%d...", attempt, MAX_RETRIES)
+                logger.warning("  Повтор %d/%d...", attempt, config.MAX_RETRIES)
 
             self._t.send(frame.encode())
 
             ack = self._wait_for_frame(
                 expected_type = FrameType.ACK,
                 file_id       = file_id,
-                timeout       = ACK_TIMEOUT,
+                timeout       = config.ACK_TIMEOUT,
                 expected_seq  = expected_seq if not is_meta else None,
                 also_accept   = FrameType.NACK,
             )
@@ -367,7 +365,7 @@ class FileSender:
                     self._frame_buf.append(frame)
             if found is not None:
                 return found
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None
 
     def _try_decode(self, raw: str, file_id: str) -> Optional[Frame]:

@@ -31,9 +31,7 @@ from .. import config
 
 logger = logging.getLogger("onix_ft.receiver")
 
-META_WAIT_TIMEOUT:  float = 3600.0
-BLOCK_WAIT_TIMEOUT: float = 120.0
-POLL_INTERVAL:      float = 2.0
+# Настройки вынесены в config.py (config.META_WAIT_TIMEOUT, config.BLOCK_WAIT_TIMEOUT, config.POLL_INTERVAL).
 
 
 class FileReceiver:
@@ -57,7 +55,7 @@ class FileReceiver:
 
         # ── шаг 1: META ──────────────────────────────────────────────────────
         logger.info(
-            "Ожидание META от отправителя (до %.0f сек)...", META_WAIT_TIMEOUT
+            "Ожидание META от отправителя (до %.0f сек)...", config.META_WAIT_TIMEOUT
         )
         meta_frame, cp = self._wait_for_meta()
         if meta_frame is None:
@@ -85,7 +83,7 @@ class FileReceiver:
                 len(cp.received), cp.total_blocks, expected_seq
             )
 
-            frame = self._wait_for_data(cp.file_id, timeout=BLOCK_WAIT_TIMEOUT)
+            frame = self._wait_for_data(cp.file_id, timeout=config.BLOCK_WAIT_TIMEOUT)
 
             if frame is None:
                 logger.error("Таймаут ожидания блока seq=%d.", expected_seq)
@@ -177,13 +175,13 @@ class FileReceiver:
                 fake = Frame(FrameType.META, cp.file_id, 0, cp.total_blocks, "")
                 return fake, cp
 
-        deadline = time.monotonic() + META_WAIT_TIMEOUT
+        deadline = time.monotonic() + config.META_WAIT_TIMEOUT
         while time.monotonic() < deadline:
             for raw in self._t.poll_new_messages():
                 frame = self._try_decode_any(raw)
                 if frame and frame.type == FrameType.META:
                     return frame, self._init_checkpoint(frame)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None, None
 
     def _init_checkpoint(self, meta: Frame) -> ReceiverCheckpoint:
@@ -234,7 +232,7 @@ class FileReceiver:
                     return None
             if self._data_buf:
                 return self._data_buf.pop(0)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(config.POLL_INTERVAL)
         return None
 
     # ── хранение частичных блоков ────────────────────────────────────────────
