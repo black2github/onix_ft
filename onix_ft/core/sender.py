@@ -210,6 +210,11 @@ class FileSender:
                 )
                 self._t.send(frame.encode())
 
+            logger.info(
+                "  Окно [%d..%d] отправлено (%d блоков) — ждём ACK[%d]...",
+                send_from, win_end, win_end - send_from + 1, win_end
+            )
+
             # Ждём ACK на последний блок окна (или NACK на любой блок)
             response = self._wait_for_frame(
                 expected_type = FrameType.ACK,
