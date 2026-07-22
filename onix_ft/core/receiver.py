@@ -79,8 +79,8 @@ class FileReceiver:
             expected_seq = missing[0]
 
             logger.info(
-                "Принято %d/%d блоков. Жду seq=%d...",
-                len(cp.received), cp.total_blocks, expected_seq
+                "Принято %d/%d блоков. Жду блок № %d...",
+                len(cp.received), cp.total_blocks, expected_seq + 1
             )
 
             frame = self._wait_for_data(cp.file_id, timeout=config.BLOCK_WAIT_TIMEOUT)
