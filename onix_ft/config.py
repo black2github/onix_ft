@@ -16,17 +16,28 @@
 # ==============================================================================
 
 # Путь к chromedriver.exe / msedgedriver.exe.
-# Если исполняемый файл добавлен в PATH — оставьте пустым ("").
-CHROMEDRIVER_PATH: str = r"C:\Users\alexe\PycharmProjects\Onix-transport\chromedriver-win64\chromedriver.exe"
+# Если исполняемый файл добавлен в PATH или скачивается через интернет — оставьте пустым ("").
+# CHROMEDRIVER_PATH: str = r"C:\onix\chromedriver-win64\chromedriver.exe"
+CHROMEDRIVER_PATH: str = ""
 
 # Использовать Edge вместо Chrome?
 USE_EDGE: bool = False
+
+# Автоматически скачивать chromedriver через webdriver-manager.
+# Удобно на Mac/Linux где версия chromedriver может не совпадать с Chrome,
+# или когда не хочется вручную следить за версией драйвера.
+# Требует: pip install webdriver-manager
+# Требует доступ в интернет при первом запуске (драйвер кешируется локально).
+# В закрытом контуре без интернета оставьте False и укажите CHROMEDRIVER_PATH.
+# USE_WEBDRIVER_MANAGER: bool = False
+USE_WEBDRIVER_MANAGER: bool = True
 
 # Путь к профилю браузера — чтобы не вводить логин при каждом запуске.
 # Chrome: %LOCALAPPDATA%\Google\Chrome\User Data
 # Edge:   %LOCALAPPDATA%\Microsoft\Edge\User Data
 # Оставьте "" — потребуется ручной логин при каждом запуске.
 # BROWSER_PROFILE_DIR: str = ""
+# BROWSER_PROFILE_DIR: str = r"C:\Users\gpbu33430\AppData\Local\Google\Chrome\OnixFT"
 BROWSER_PROFILE_DIR: str = r"C:\Users\alexe\AppData\Local\Google\Chrome\OnixFT"
 
 # ==============================================================================
