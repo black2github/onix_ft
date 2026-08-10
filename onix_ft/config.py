@@ -16,7 +16,10 @@
 # ==============================================================================
 
 # Путь к chromedriver.exe / msedgedriver.exe.
-# Если исполняемый файл добавлен в PATH или скачивается через интернет — оставьте пустым ("").
+# Драйвер ищется в таком порядке: этот путь → автозагрузка
+# (USE_WEBDRIVER_MANAGER) → Selenium Manager. Первые два требуют интернета,
+# поэтому В ЗАКРЫТОМ КОНТУРЕ ЭТОТ ПУТЬ ОБЯЗАТЕЛЕН.
+# Поддерживаются переменные окружения: r"%ProgramData%\onix\chromedriver.exe".
 # CHROMEDRIVER_PATH: str = r"C:\onix\chromedriver-win64\chromedriver.exe"
 CHROMEDRIVER_PATH: str = ""
 
@@ -26,19 +29,27 @@ USE_EDGE: bool = False
 # Автоматически скачивать chromedriver через webdriver-manager.
 # Удобно на Mac/Linux где версия chromedriver может не совпадать с Chrome,
 # или когда не хочется вручную следить за версией драйвера.
-# Требует: pip install webdriver-manager
-# Требует доступ в интернет при первом запуске (драйвер кешируется локально).
-# В закрытом контуре без интернета оставьте False и укажите CHROMEDRIVER_PATH.
+# Требует: pip install webdriver-manager + доступ в интернет при первом запуске.
+# Флаг игнорируется, если задан CHROMEDRIVER_PATH; если автозагрузка недоступна,
+# запуск не падает — драйвер ищет Selenium Manager (тоже нужен интернет).
 # USE_WEBDRIVER_MANAGER: bool = False
 USE_WEBDRIVER_MANAGER: bool = True
 
 # Путь к профилю браузера — чтобы не вводить логин при каждом запуске.
-# Chrome: %LOCALAPPDATA%\Google\Chrome\User Data
-# Edge:   %LOCALAPPDATA%\Microsoft\Edge\User Data
+# Значение разворачивает переменные окружения, поэтому НЕ ПИШИТЕ здесь свой
+# логин: путь с чужим именем пользователя ломает запуск у всех остальных
+# (Chrome не может создать профиль в чужой папке и молча висит до таймаута).
 # Оставьте "" — потребуется ручной логин при каждом запуске.
+# На VDI с перенаправленным (сетевым) AppData надёжнее локальный каталог,
+# например r"C:\onix\profile-onixft".
 # BROWSER_PROFILE_DIR: str = ""
-# BROWSER_PROFILE_DIR: str = r"C:\Users\gpbu33430\AppData\Local\Google\Chrome\OnixFT"
-BROWSER_PROFILE_DIR: str = r"C:\Users\alexe\AppData\Local\Google\Chrome\OnixFT"
+BROWSER_PROFILE_DIR: str = r"%LOCALAPPDATA%\Google\Chrome\OnixFT"
+
+# Журнал chromedriver для диагностики запуска ("" — выключен).
+# Включайте, когда браузер не поднимается: в журнале видно, какой именно
+# исполняемый файл драйвер зовёт и чем это заканчивается.
+# DRIVER_LOG_PATH: str = r"%TEMP%\onixft-chromedriver.log"
+DRIVER_LOG_PATH: str = ""
 
 # ==============================================================================
 #  ONIX

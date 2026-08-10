@@ -32,6 +32,7 @@ try:
 except ImportError:
     SELENIUM_AVAILABLE = False
 
+from . import preflight
 from .base import BaseTransport
 from .. import config
 
@@ -92,46 +93,124 @@ class OnixSeleniumTransport(BaseTransport):
     # -- Жизненный цикл -------------------------------------------------------
 
     def open(self):
-        """Запустить браузер и открыть страницу чата Onix."""
+        """
+        Запустить браузер и открыть страницу чата Onix.
+
+        Перед запуском выполняются предполётные проверки (`preflight`):
+        доступность каталога профиля, его занятость другим окном браузера и
+        совпадение мажорных версий браузера и драйвера. Без них типовая
+        ошибка конфигурации выглядела как молчаливое зависание на 120 секунд
+        с `ReadTimeoutError` в конце.
+        """
         options_cls = webdriver.EdgeOptions if config.USE_EDGE else webdriver.ChromeOptions
         opts = options_cls()
         opts.add_argument("--disable-extensions")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
-        if config.BROWSER_PROFILE_DIR:
-            opts.add_argument(f"--user-data-dir={config.BROWSER_PROFILE_DIR}")
 
-        if getattr(config, 'USE_WEBDRIVER_MANAGER', False):
-            # Автоматическое скачивание подходящего драйвера через webdriver-manager.
-            # Удобно на Mac/Linux где версия chromedriver может не совпадать с Chrome.
-            # Требует: pip install webdriver-manager
-            # Требует доступ в интернет при первом запуске (драйвер кешируется).
-            try:
-                if config.USE_EDGE:
-                    from webdriver_manager.microsoft import EdgeChromiumDriverManager
-                    svc = EdgeService(EdgeChromiumDriverManager().install())
-                    self._driver = webdriver.Edge(service=svc, options=opts)
-                else:
-                    from webdriver_manager.chrome import ChromeDriverManager
-                    svc = ChromeService(ChromeDriverManager().install())
-                    self._driver = webdriver.Chrome(service=svc, options=opts)
-                logger.info("Драйвер установлен через webdriver-manager.")
-            except ImportError:
-                raise ImportError(
-                    "USE_WEBDRIVER_MANAGER=True, но webdriver-manager не установлен. "
-                    "Выполните: pip install webdriver-manager"
-                )
+        image = preflight.EDGE_IMAGE if config.USE_EDGE else preflight.CHROME_IMAGE
+        profile_dir = preflight.expand_path(config.BROWSER_PROFILE_DIR)
+        if profile_dir:
+            preflight.ensure_profile_dir(profile_dir)
+            preflight.check_profile_free(profile_dir, image)
+            opts.add_argument(f"--user-data-dir={profile_dir}")
+            logger.info("Профиль браузера: %s", profile_dir)
         else:
-            drv_path = config.CHROMEDRIVER_PATH or None
+            logger.info("Профиль браузера не задан — потребуется ручной логин.")
+
+        drv_path = self._resolve_driver_path()
+        self._check_versions(drv_path)
+
+        svc_kwargs = {"executable_path": drv_path}
+        driver_log = preflight.expand_path(getattr(config, "DRIVER_LOG_PATH", ""))
+        if driver_log:
+            driver_log.parent.mkdir(parents=True, exist_ok=True)
+            svc_kwargs["service_args"] = ["--verbose", f"--log-path={driver_log}"]
+            logger.info("Журнал драйвера: %s", driver_log)
+
+        try:
             if config.USE_EDGE:
-                svc = EdgeService(executable_path=drv_path)
+                svc = EdgeService(**svc_kwargs)
                 self._driver = webdriver.Edge(service=svc, options=opts)
             else:
-                svc = ChromeService(executable_path=drv_path)
+                svc = ChromeService(**svc_kwargs)
                 self._driver = webdriver.Chrome(service=svc, options=opts)
+        except Exception as exc:
+            raise RuntimeError(
+                preflight.session_failure_hint(profile_dir, drv_path, driver_log)
+            ) from exc
 
         self._driver.get(config.ONIX_CHAT_URL)
         logger.info("Браузер открыт: %s", config.ONIX_CHAT_URL)
+
+    @staticmethod
+    def _resolve_driver_path() -> Optional[str]:
+        """
+        Определить путь к драйверу и сказать в журнал, откуда он взят.
+
+        Порядок (первый сработавший источник побеждает):
+          1. `CHROMEDRIVER_PATH` — обязательный путь для закрытого контура;
+          2. `USE_WEBDRIVER_MANAGER` — автозагрузка (нужен интернет);
+          3. ничего не задано — драйвер ищет Selenium Manager (нужен интернет).
+        """
+        raw = getattr(config, "CHROMEDRIVER_PATH", "") or ""
+        if raw:
+            path = preflight.expand_path(raw)
+            if not path or not path.exists():
+                raise preflight.PreflightError(
+                    f"CHROMEDRIVER_PATH указывает на несуществующий файл: {raw}\n"
+                    "Проверьте путь в onix_ft/config.py — в закрытом контуре "
+                    "драйвер подкладывается вручную и путь обязателен."
+                )
+            logger.info("Драйвер из CHROMEDRIVER_PATH: %s", path)
+            return str(path)
+
+        if getattr(config, "USE_WEBDRIVER_MANAGER", False):
+            # Автозагрузка — не обязательный источник: её отказ (нет пакета,
+            # нет интернета) не должен ронять запуск, дальше пробуем
+            # Selenium Manager. Жёсткая ошибка здесь стоила бы работающего
+            # внешнего контура ради подсказки для закрытого.
+            try:
+                if config.USE_EDGE:
+                    from webdriver_manager.microsoft import EdgeChromiumDriverManager as Manager
+                else:
+                    from webdriver_manager.chrome import ChromeDriverManager as Manager
+
+                path = Manager().install()
+                logger.info("Драйвер получен через webdriver-manager: %s", path)
+                return path
+            except ImportError:
+                logger.warning(
+                    "USE_WEBDRIVER_MANAGER=True, но пакет webdriver-manager не установлен. "
+                    "В закрытом контуре автозагрузка невозможна — укажите CHROMEDRIVER_PATH."
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Автозагрузка драйвера не удалась (%s). В закрытом контуре "
+                    "укажите CHROMEDRIVER_PATH в config.py.", exc
+                )
+
+        logger.info(
+            "CHROMEDRIVER_PATH не задан — драйвер ищет Selenium Manager (нужен интернет). "
+            "В закрытом контуре укажите путь к драйверу в config.py."
+        )
+        return None
+
+    @staticmethod
+    def _check_versions(drv_path: Optional[str]) -> None:
+        """Сверить мажоры браузера и драйвера; расхождение — отказ до запуска."""
+        if not drv_path:
+            return  # драйвер подберёт Selenium Manager — версия согласована им
+        browser_version = preflight.detect_browser_version(config.USE_EDGE)
+        driver_version  = preflight.detect_driver_version(drv_path)
+        logger.info(
+            "Версии: браузер %s, драйвер %s",
+            browser_version or "не определена",
+            driver_version or "не определена",
+        )
+        conflict = preflight.version_conflict(browser_version, driver_version, config.USE_EDGE)
+        if conflict:
+            raise preflight.PreflightError(conflict)
 
     def wait_ready(self, timeout: float = None):
         """
@@ -280,26 +359,19 @@ class OnixSeleniumTransport(BaseTransport):
         """
         Вставить текст в поле ввода slate.js и отправить.
 
-        Поле содержит placeholder «Введите сообщение», реализованный через CSS —
-        он не является реальным текстом в DOM. Перед вставкой явно очищаем поле
-        через Ctrl+A + execCommand('delete'), чтобы удалить любой реальный текст,
-        оставшийся с прошлой итерации.
-
-        Стратегия вставки:
-          1. execCommand('insertText') — slate.js воспринимает как реальный ввод
-             пользователя и активирует кнопку «Отправить».
-          2. Если не сработало — буфер обмена (pyperclip + Ctrl+V).
+        Четыре метода вставки по убыванию приоритета:
+          1. execCommand('insertText') — основной, мгновенный.
+          2. pyperclip + Ctrl+V — если метод 1 не активировал кнопку.
+          3. send_keys посимвольно — для VDI где буфер обмена заблокирован.
+          4. Enter напрямую в поле — обход кнопки «Отправить» через клавишу.
+             На слабых машинах (8 ГБ RAM) slate.js может не успеть активировать
+             кнопку, но Enter всегда обрабатывается независимо от состояния кнопки.
         """
         input_el = self._find(SEL_INPUT_BOX)
         input_el.click()
         time.sleep(0.2)
 
-        # Очищаем поле перед вставкой через JS — без send_keys(Ctrl+A).
-        # Причина: send_keys отправляет события клавиатуры в активный элемент
-        # браузера. Если пользователь в этот момент работает в другом чате,
-        # фокус может сместиться туда и Ctrl+A выделит текст в чужом чате.
-        # JS-вызов focus() + selectAll работает точечно с конкретным элементом
-        # независимо от того, где находится фокус пользователя.
+        # Очищаем поле через JS — без send_keys чтобы не перехватить фокус.
         self._driver.execute_script(
             "arguments[0].focus();"
             "document.execCommand('selectAll', false, null);"
@@ -308,57 +380,114 @@ class OnixSeleniumTransport(BaseTransport):
         )
         time.sleep(0.1)
 
-        # Вставляем текст через execCommand('insertText').
-        # Slate.js обрабатывает это как реальный пользовательский ввод
-        # и активирует кнопку «Отправить».
+        # Метод 1: execCommand('insertText')
         inserted = self._driver.execute_script(
             "return document.execCommand('insertText', false, arguments[0]);",
             text
         )
+        if inserted and self._wait_for_send_btn(raise_on_fail=False):
+            self._click_send_btn()
+            return
 
-        if not inserted:
-            logger.debug("execCommand('insertText') не сработал, пробуем clipboard.")
-            self._send_via_clipboard(input_el, text)
+        # Метод 2: буфер обмена (pyperclip + Ctrl+V)
+        logger.warning("Метод 1 (execCommand) не сработал — пробуем clipboard.")
+        if self._send_via_clipboard(input_el, text):
+            if self._wait_for_send_btn(raise_on_fail=False):
+                self._click_send_btn()
+                return
 
-        # Ждём пока slate.js активирует кнопку «Отправить».
-        # Переход из disabled → enabled происходит асинхронно.
-        try:
-            send_btn = WebDriverWait(self._driver, config.SEND_BTN_TIMEOUT).until(
-                EC.element_to_be_clickable(SEL_SEND_BUTTON)
-            )
-        except TimeoutException:
-            logger.warning(
-                "Кнопка «Отправить» не активировалась после JS-вставки. "
-                "Пробуем clipboard."
-            )
-            self._send_via_clipboard(input_el, text)
-            send_btn = WebDriverWait(self._driver, config.SEND_BTN_TIMEOUT).until(
-                EC.element_to_be_clickable(SEL_SEND_BUTTON)
-            )
+        # Метод 3: send_keys посимвольно
+        logger.warning("Метод 2 (clipboard) не сработал — пробуем send_keys.")
+        self._send_via_keys(input_el, text)
+        if self._wait_for_send_btn(raise_on_fail=False):
+            self._click_send_btn()
+            return
 
-        send_btn.click()
+        # Метод 4: отправка через Enter напрямую в поле ввода.
+        # Обходит кнопку «Отправить» полностью — на слабых машинах slate.js
+        # может не успеть активировать кнопку, но Enter всегда работает
+        # если текст присутствует в поле. Пробуем вставить заново и нажать Enter.
+        logger.warning(
+            "Метод 3 (send_keys) не активировал кнопку — "
+            "пробуем вставку + Enter."
+        )
+        self._driver.execute_script(
+            "arguments[0].focus();"
+            "document.execCommand('selectAll', false, null);"
+            "document.execCommand('delete', false, null);",
+            input_el
+        )
+        time.sleep(0.2)
+        self._driver.execute_script(
+            "document.execCommand('insertText', false, arguments[0]);",
+            text
+        )
+        time.sleep(0.5)  # дать slate.js время обработать текст
+        input_el.send_keys(Keys.RETURN)
         time.sleep(config.SEND_DELAY)
-        logger.debug("Отправлено %d символов.", len(text))
+        logger.debug("Отправлено через Enter, %d символов.", len(text))
 
-    def _send_via_clipboard(self, input_el, text: str) -> None:
+    def _wait_for_send_btn(self, raise_on_fail: bool = True) -> bool:
         """
-        Запасной метод вставки через буфер обмена (Ctrl+V).
-        Требует библиотеку pyperclip: pip install pyperclip
+        Ждать активации кнопки «Отправить».
+        Возвращает True если кнопка стала активна, False если таймаут.
+        """
+        try:
+            WebDriverWait(
+                self._driver, config.SEND_BTN_TIMEOUT, poll_frequency=0.1
+            ).until(EC.element_to_be_clickable(SEL_SEND_BUTTON))
+            return True
+        except TimeoutException:
+            if raise_on_fail:
+                raise
+            return False
+
+    def _click_send_btn(self) -> None:
+        """Нажать кнопку «Отправить» и выдержать паузу."""
+        btn = self._driver.find_element(*SEL_SEND_BUTTON)
+        btn.click()
+        time.sleep(config.SEND_DELAY)
+        logger.debug("Отправлено.")
+
+    def _send_via_clipboard(self, input_el, text: str) -> bool:
+        """
+        Вставка через буфер обмена (Ctrl+V).
+        Возвращает True если удалось, False если pyperclip не установлен.
         """
         try:
             import pyperclip
         except ImportError:
-            raise RuntimeError(
-                "Не удалось вставить текст через JS, а pyperclip не установлен.\n"
-                "Установите: pip install pyperclip"
-            )
+            logger.warning("pyperclip не установлен. pip install pyperclip")
+            return False
+        try:
+            input_el.click()
+            time.sleep(0.1)
+            input_el.send_keys(Keys.CONTROL, 'a')
+            time.sleep(0.1)
+            pyperclip.copy(text)
+            input_el.send_keys(Keys.CONTROL, 'v')
+            time.sleep(0.3)
+            return True
+        except Exception as e:
+            logger.warning("Ошибка вставки через clipboard: %s", e)
+            return False
+
+    def _send_via_keys(self, input_el, text: str) -> None:
+        """
+        Вставка через send_keys посимвольно.
+        Медленно, но работает на VDI где execCommand и clipboard заблокированы.
+        """
         input_el.click()
         time.sleep(0.1)
         input_el.send_keys(Keys.CONTROL, 'a')
         time.sleep(0.1)
-        pyperclip.copy(text)
-        input_el.send_keys(Keys.CONTROL, 'v')
-        time.sleep(0.3)
+        input_el.send_keys(Keys.DELETE)
+        time.sleep(0.1)
+        CHUNK = 200
+        for i in range(0, len(text), CHUNK):
+            input_el.send_keys(text[i:i + CHUNK])
+            time.sleep(0.05)
+        logger.debug("send_keys: вставлено %d символов.", len(text))
 
     # -- Чтение новых сообщений -----------------------------------------------
 
