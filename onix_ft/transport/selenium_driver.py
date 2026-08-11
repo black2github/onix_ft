@@ -39,6 +39,27 @@ from .. import config
 logger = logging.getLogger("onix_ft.transport")
 
 
+def browser_arguments(
+    profile_dir: Optional[Path] = None,
+    app_url: Optional[str] = None,
+) -> list:
+    """
+    Ключи командной строки браузера.
+
+    `app_url` (ключ `--app`) задаёт стартовый адрес окна и тем самым отменяет
+    стартовые страницы профиля и доменной политики: корпоративный портал
+    больше не может забрать вкладку, к которой подключается драйвер.
+    Позиционный URL для этого не годится — chromedriver его отбрасывает
+    (проверено на chromedriver 149/151).
+    """
+    args = ["--disable-extensions", "--no-sandbox", "--disable-dev-shm-usage"]
+    if profile_dir:
+        args.append(f"--user-data-dir={profile_dir}")
+    if app_url:
+        args.append(f"--app={app_url}")
+    return args
+
+
 # ==============================================================================
 #  Селекторы Onix (не требуют ручного редактирования)
 # ==============================================================================
@@ -104,19 +125,21 @@ class OnixSeleniumTransport(BaseTransport):
         """
         options_cls = webdriver.EdgeOptions if config.USE_EDGE else webdriver.ChromeOptions
         opts = options_cls()
-        opts.add_argument("--disable-extensions")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
 
         image = preflight.EDGE_IMAGE if config.USE_EDGE else preflight.CHROME_IMAGE
         profile_dir = preflight.expand_path(config.BROWSER_PROFILE_DIR)
         if profile_dir:
             preflight.ensure_profile_dir(profile_dir)
             preflight.check_profile_free(profile_dir, image)
-            opts.add_argument(f"--user-data-dir={profile_dir}")
             logger.info("Профиль браузера: %s", profile_dir)
         else:
             logger.info("Профиль браузера не задан — потребуется ручной логин.")
+
+        app_url = config.ONIX_CHAT_URL if getattr(config, "OPEN_IN_APP_WINDOW", False) else None
+        if app_url:
+            logger.info("Окно приложения: браузер стартует сразу на %s", app_url)
+        for argument in browser_arguments(profile_dir, app_url):
+            opts.add_argument(argument)
 
         drv_path = self._resolve_driver_path()
         self._check_versions(drv_path)

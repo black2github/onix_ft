@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from onix_ft.transport import preflight
+from onix_ft.transport import preflight, selenium_driver
 from onix_ft.transport.preflight import PreflightError
 
 
@@ -182,11 +182,82 @@ def test_session_failure_hint_mentions_key_suspects():
     assert "DRIVER_LOG_PATH" in hint  # без журнала — подсказка его включить
 
 
-def test_session_failure_hint_points_to_existing_log():
+def test_session_failure_hint_points_to_existing_log(tmp_path):
+    log = tmp_path / "cd.log"
+    log.write_text("[INFO]: обычный журнал без признаков угона", encoding="utf-8")
     hint = preflight.session_failure_hint(
-        Path(r"C:\onix\profile"), r"C:\onix\chromedriver.exe", Path(r"C:\onix\cd.log")
+        Path(r"C:\onix\profile"), r"C:\onix\chromedriver.exe", log
     )
-    assert r"C:\onix\cd.log" in hint
+    assert str(log) in hint
+
+
+# ── угон стартовой вкладки корпоративной политикой ───────────────────────────
+
+HIJACK_LOG = """\
+[1786439807.487][INFO]: Populating Preferences file: {
+   "default_search_provider": {
+      "url": "https://sfera/SitePages/Search.aspx?q={searchTerms}"
+   }
+}
+[1786439808.717][DEBUG]: DevTools HTTP Response: [ {
+   "id": "F90F24EAD83D0BC6FD95FA3BED48C874",
+   "type": "page",
+   "url": "https://sfera/"
+} ]
+[1786439808.739][DEBUG]: DevTools WebSocket Command: Target.setAutoAttach (id=3)
+[1786439808.739][DEBUG]: DevTools WebSocket Response:  (id=3) browser \
+{"code":-32001,"message":"Session with given id not found."}
+"""
+
+
+def test_startup_page_hijack_detects_and_names_page(tmp_path):
+    log = tmp_path / "driver.log"
+    log.write_text(HIJACK_LOG, encoding="utf-8")
+    message = preflight.startup_page_hijack(log)
+    assert message is not None
+    assert "OPEN_IN_APP_WINDOW" in message              # назван рычаг, которым лечится
+    # Названа именно перехватившая вкладка, а не поисковик из дампа Preferences
+    assert "открыл https://sfera/ —" in message
+    assert "searchTerms" not in message
+
+
+def test_startup_page_hijack_silent_on_other_logs(tmp_path):
+    log = tmp_path / "driver.log"
+    log.write_text("[INFO]: Starting ChromeDriver\n[INFO]: RESPONSE InitSession", encoding="utf-8")
+    assert preflight.startup_page_hijack(log) is None
+
+
+def test_startup_page_hijack_survives_missing_log(tmp_path):
+    assert preflight.startup_page_hijack(None) is None
+    assert preflight.startup_page_hijack(tmp_path / "нет-такого.log") is None
+
+
+def test_session_failure_hint_replaces_checklist_when_cause_known(tmp_path):
+    """Причина установлена — общий чек-лист не показываем, чтобы не путать."""
+    log = tmp_path / "driver.log"
+    log.write_text(HIJACK_LOG, encoding="utf-8")
+    hint = preflight.session_failure_hint(Path(r"C:\onix\profile"), None, log)
+    assert "OPEN_IN_APP_WINDOW" in hint
+    assert "Что проверить по порядку" not in hint
+
+
+# ── ключи запуска браузера ───────────────────────────────────────────────────
+
+def test_browser_arguments_without_app_url():
+    args = selenium_driver.browser_arguments(Path(r"C:\onix\profile"))
+    assert r"--user-data-dir=C:\onix\profile" in args
+    assert not any(a.startswith("--app=") for a in args)
+
+
+def test_browser_arguments_with_app_url():
+    args = selenium_driver.browser_arguments(Path(r"C:\onix\profile"), "https://webexp.msg.gpb.ru/#/")
+    assert "--app=https://webexp.msg.gpb.ru/#/" in args
+
+
+def test_browser_arguments_without_profile():
+    args = selenium_driver.browser_arguments(None)
+    assert not any(a.startswith("--user-data-dir") for a in args)
+    assert "--no-sandbox" in args
 
 
 if __name__ == "__main__":
