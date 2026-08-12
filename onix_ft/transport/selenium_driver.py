@@ -10,6 +10,7 @@ Selenium-транспорт для Onix.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -39,24 +40,61 @@ from .. import config
 logger = logging.getLogger("onix_ft.transport")
 
 
+def feed_record(index: int, element_id: str, seen: bool, bubbles: int, text: str) -> dict:
+    """
+    Строка снимка ленты чата для диагностики потерянных блоков.
+
+    `bubbles` — сколько пузырей сообщений внутри одной строки ленты: значение
+    больше единицы означает, что мессенджер склеил несколько сообщений в одну
+    строку, а читаем мы только первое (тогда блок теряется молча).
+    `seen` — строка уже помечена как прочитанная: если при этом текст новый,
+    значит DOM-узел переиспользован и сообщение пропущено.
+    """
+    text = text or ""
+    return {
+        "i":       index,
+        "id":      element_id,
+        "seen":    seen,
+        "bubbles": bubbles,
+        "len":     len(text),
+        "head":    text[:60].replace("\n", "⏎"),
+    }
+
+
+def append_feed_records(path: Path, records: list) -> None:
+    """Дописать снимок ленты в JSONL-файл (одна строка — одна строка ленты)."""
+    if not records:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def browser_arguments(
     profile_dir: Optional[Path] = None,
     app_url: Optional[str] = None,
+    debug_pipe: bool = False,
 ) -> list:
     """
     Ключи командной строки браузера.
 
     `app_url` (ключ `--app`) задаёт стартовый адрес окна и тем самым отменяет
-    стартовые страницы профиля и доменной политики: корпоративный портал
-    больше не может забрать вкладку, к которой подключается драйвер.
-    Позиционный URL для этого не годится — chromedriver его отбрасывает
-    (проверено на chromedriver 149/151).
+    стартовые страницы профиля и доменной политики: браузер открывает сразу
+    нужный адрес. Позиционный URL для этого не годится — chromedriver его
+    отбрасывает (проверено на chromedriver 149/151).
+
+    `debug_pipe` переводит связку драйвер–браузер на pipe вместо порта
+    отладки: запасной канал там, где браузер не отдаёт отладочную сессию.
     """
     args = ["--disable-extensions", "--no-sandbox", "--disable-dev-shm-usage"]
     if profile_dir:
         args.append(f"--user-data-dir={profile_dir}")
     if app_url:
         args.append(f"--app={app_url}")
+    if debug_pipe:
+        args.append("--remote-debugging-pipe")
     return args
 
 
@@ -73,6 +111,10 @@ SEL_SEND_BUTTON = (By.CSS_SELECTOR,
 
 # Строки сообщений в ленте чата
 SEL_MESSAGE_ITEM = (By.CSS_SELECTOR, ".chat-message-row")
+
+# Пузырь одного сообщения внутри строки ленты. Одна строка может содержать
+# НЕСКОЛЬКО пузырей — мессенджер склеивает подряд идущие сообщения автора.
+SEL_MESSAGE_BUBBLE = ".chat-message__bubble"
 
 # --- Селекторы для очистки истории чата -------------------------------------
 
@@ -138,8 +180,20 @@ class OnixSeleniumTransport(BaseTransport):
         app_url = config.ONIX_CHAT_URL if getattr(config, "OPEN_IN_APP_WINDOW", False) else None
         if app_url:
             logger.info("Окно приложения: браузер стартует сразу на %s", app_url)
-        for argument in browser_arguments(profile_dir, app_url):
+        debug_pipe = bool(getattr(config, "USE_DEBUG_PIPE", False))
+        if debug_pipe:
+            logger.info("Канал связи с браузером: pipe (вместо порта отладки).")
+        for argument in browser_arguments(profile_dir, app_url, debug_pipe):
             opts.add_argument(argument)
+
+        policy_problem = preflight.describe_devtools_policy(
+            preflight.read_chrome_policy(preflight.DEVTOOLS_POLICY, config.USE_EDGE)
+        )
+        if policy_problem:
+            # Предупреждение, а не отказ: политика может приходить и из
+            # облачного управления поверх реестра — по чтению реестра нельзя
+            # запрещать запуск, который в реальности мог бы состояться.
+            logger.warning(policy_problem)
 
         drv_path = self._resolve_driver_path()
         self._check_versions(drv_path)
@@ -276,6 +330,40 @@ class OnixSeleniumTransport(BaseTransport):
                 "Проверьте логин и значение SEL_INPUT_BOX."
             )
 
+    def _feed_units(self, rows: list) -> list:
+        """
+        Разложить строки ленты на ЕДИНИЦЫ ЧТЕНИЯ — по одному сообщению.
+
+        Мессенджер склеивает подряд идущие сообщения одного автора в одну
+        строку `.chat-message-row` с несколькими пузырями внутри. Если считать
+        единицей строку, второе и последующие сообщения не читаются никогда:
+        строка помечается виденной по первому пузырю, а остальной текст
+        пропадает молча — блок «теряется», приём срывается на NACK
+        (инцидент 2026-08-12, воспроизведён на макете ленты).
+
+        Возвращает список троек (ключ, элемент, это_пузырь): ключ —
+        идентификатор пузыря, элемент — то, из чего читать текст. Строка без
+        пузырей (служебный разделитель) остаётся единицей сама по себе.
+        """
+        units = []
+        for row in rows:
+            try:
+                bubbles = row.find_elements(By.CSS_SELECTOR, SEL_MESSAGE_BUBBLE)
+            except Exception:
+                bubbles = []
+            if bubbles:
+                for bubble in bubbles:
+                    try:
+                        units.append((self._element_id(bubble), bubble, True))
+                    except Exception:
+                        continue
+            else:
+                try:
+                    units.append((self._element_id(row), row, False))
+                except Exception:
+                    continue
+        return units
+
     def _refresh_seen_ids(self):
         """
         Обновить множество виденных элементов — пометить всё что сейчас
@@ -283,10 +371,12 @@ class OnixSeleniumTransport(BaseTransport):
         Вызывается после очистки истории или при необходимости сбросить курсор.
         """
         items = self._driver.find_elements(*SEL_MESSAGE_ITEM)
-        for el in items:
-            self._seen_ids.add(self._element_id(el))
+        units = self._feed_units(items)
+        for key, _el, _is_bubble in units:
+            self._seen_ids.add(key)
         logger.info(
-            "Помечено как виденных: %d элементов в ленте.", len(items)
+            "Помечено как виденных: %d сообщений в %d строках ленты.",
+            len(units), len(items)
         )
 
     def close(self):
@@ -530,39 +620,88 @@ class OnixSeleniumTransport(BaseTransport):
         except Exception:
             return
 
-        new_items = [el for el in items
-                     if self._element_id(el) not in self._seen_ids]
+        # Единица чтения — сообщение (пузырь), а не строка ленты: в одной
+        # строке мессенджер может склеить несколько сообщений подряд.
+        new_units = [unit for unit in self._feed_units(items)
+                     if unit[0] not in self._seen_ids]
 
         logger.debug(
-            "Всего элементов в ленте: %d, новых: %d",
-            len(items), len(new_items)
+            "Строк в ленте: %d, новых сообщений: %d",
+            len(items), len(new_units)
         )
 
-        for el in new_items:
-            # Помечаем как виденный вне зависимости от того, извлечём текст или нет.
-            self._seen_ids.add(self._element_id(el))
+        if new_units:
+            self._dump_feed(items)
+
+        for key, el, is_bubble in new_units:
+            # Помечаем как виденное вне зависимости от того, извлечём текст или нет.
+            self._seen_ids.add(key)
             try:
-                text = self._extract_text(el)
+                text = self._extract_text(el, is_bubble)
                 if text:
                     logger.debug("Новое сообщение: %r", text[:80])
                     yield text
                 else:
-                    logger.debug("Пустой элемент (служебный?) — пропускаем.")
+                    # Не debug: пустая строка ленты — кандидат в потерянный блок
+                    logger.warning(
+                        "Строка ленты без текста — пропущена (возможен потерянный блок)."
+                    )
             except StaleElementReferenceException:
                 # Элемент исчез из DOM пока мы его читали — пропускаем.
+                logger.warning("Строка ленты исчезла из DOM при чтении — пропущена.")
                 continue
+
+    def _dump_feed(self, items: list, tail: int = 15) -> None:
+        """
+        Записать снимок хвоста ленты, если включён config.FEED_DUMP_PATH.
+
+        Нужен, когда блок теряется молча: по снимку видно, появилось ли
+        сообщение в DOM вообще, сколько пузырей в строке (склейка сообщений)
+        и не переиспользован ли уже прочитанный узел.
+        """
+        dump_path = preflight.expand_path(getattr(config, "FEED_DUMP_PATH", ""))
+        if not dump_path:
+            return
+        records = []
+        for index, el in enumerate(items[-tail:]):
+            try:
+                element_id = self._element_id(el)
+            except Exception:
+                continue
+            try:
+                bubbles = len(el.find_elements(By.CSS_SELECTOR, ".chat-message__bubble"))
+            except Exception:
+                bubbles = -1
+            try:
+                text = self._extract_text(el)
+            except Exception:
+                text = ""
+            records.append(
+                feed_record(index, element_id, element_id in self._seen_ids, bubbles, text)
+            )
+        try:
+            append_feed_records(dump_path, records)
+        except OSError as exc:
+            logger.warning("Не удалось записать снимок ленты: %s", exc)
 
     # -- Вспомогательные методы -----------------------------------------------
 
-    def _extract_text(self, row_el) -> str:
+    def _extract_text(self, row_el, is_bubble: bool = False) -> str:
         """
         Извлечь текст сообщения из строки .chat-message-row.
         Пробуем несколько селекторов, так как структура DOM может отличаться
         для входящих и исходящих сообщений.
 
+        `is_bubble=True` означает, что элемент уже является пузырём одного
+        сообщения (см. `_feed_units`) — искать пузырь внутри него не нужно,
+        и лишние обращения к браузеру пропускаются.
+
         Onix добавляет временну́ю метку (HH:MM) в конец текстового содержимого
         пузыря как отдельную строку — отфильтровываем её через _strip_timestamp().
         """
+        if is_bubble:
+            return self._strip_timestamp(row_el.text.strip())
+
         for selector in (
             ".chat-message__bubble",
             ".chat-message__text",

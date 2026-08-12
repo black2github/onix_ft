@@ -397,23 +397,91 @@ def check_profile_free(profile_dir: Path, image: str = CHROME_IMAGE) -> None:
     )
 
 
-# ── угон стартовой вкладки корпоративной политикой ───────────────────────────
+# ── политика домена: запрет средств разработчика ─────────────────────────────
 
-# Маркер в журнале драйвера: chromedriver подключился к вкладке, и сессия
-# тут же исчезла — вкладку из-под него забрала стартовая страница.
-HIJACK_MARKER = "Session with given id not found"
+# Значения политики DeveloperToolsAvailability:
+#   0 — по умолчанию (разрешены везде, кроме расширений из политики)
+#   1 — разрешены
+#   2 — ЗАПРЕЩЕНЫ: вместе с панелью F12 закрывается и протокол отладки,
+#       через который драйвер управляет браузером, — автоматизация невозможна
+DEVTOOLS_POLICY = "DeveloperToolsAvailability"
+DEVTOOLS_DISALLOWED = 2
+
+CHROME_POLICY_KEYS = (
+    r"SOFTWARE\Policies\Google\Chrome",
+    r"SOFTWARE\Policies\Microsoft\Edge",
+)
 
 
-def startup_page_hijack(driver_log: Optional[Path]) -> Optional[str]:
+def read_chrome_policy(name: str, use_edge: bool = False) -> Optional[int]:
     """
-    Разобрать журнал драйвера на предмет угона стартовой вкладки.
+    Прочитать числовое значение политики браузера из реестра.
 
-    Картина отказа (инцидент 2026-08-11, VDI с доменной политикой): Chrome
-    поднимается, но первая вкладка — корпоративный портал из политики
-    `RestoreOnStartupURLs`, а не пустая страница автоматизации. Драйвер
-    успевает подключиться к этой вкладке, портал её тут же переигрывает
-    (редирект/предзагрузка), и ответ на NEW_SESSION не приходит вообще:
-    браузер на экране живой, а `driver.get()` до нужного адреса не доходит.
+    Только чтение; None — политика не задана на этой машине ИЛИ приходит из
+    облачного управления (Chrome Browser Cloud Management), которое в реестре
+    не видно. Поэтому отсутствие значения ничего не опровергает.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    key_path = CHROME_POLICY_KEYS[1] if use_edge else CHROME_POLICY_KEYS[0]
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(root, key_path, 0, winreg.KEY_READ | view) as key:
+                    value, _ = winreg.QueryValueEx(key, name)
+                    return int(value)
+            except (OSError, ValueError, TypeError):
+                continue
+    return None
+
+
+def describe_devtools_policy(value: Optional[int]) -> Optional[str]:
+    """
+    Текст предупреждения, если политика запрещает средства разработчика.
+
+    Разрешающие значения и «не задано» — молчим: блокировать работу по
+    догадке нельзя, политика может приходить и из облака поверх реестра.
+    """
+    if value != DEVTOOLS_DISALLOWED:
+        return None
+    return (
+        f"Политика домена {DEVTOOLS_POLICY}={DEVTOOLS_DISALLOWED} — средства "
+        "разработчика запрещены. Драйвер управляет браузером через тот же "
+        "протокол отладки, поэтому передача работать не будет: браузер "
+        "откроется и страницу покажет, но сессию отладки не отдаст.\n"
+        "Проверьте на этой машине F12 в обычном окне браузера; лечится только "
+        "администраторами Chrome — нужно исключение для вашей учётной записи "
+        "или группы (сравните chrome://policy с машиной, где передача идёт)."
+    )
+
+
+# ── браузер не отдал отладочную сессию ───────────────────────────────────────
+
+# Маркер в журнале драйвера: браузер выдал идентификатор сессии по
+# attachToTarget и на следующей же команде заявил, что такой сессии не знает.
+REFUSED_MARKER = "Session with given id not found"
+
+
+def debug_session_refused(driver_log: Optional[Path]) -> Optional[str]:
+    """
+    Разобрать журнал драйвера: браузер отказал в отладочной сессии вкладки.
+
+    Картина (инцидент закрытого контура, 2026-08-11): Chrome поднимается,
+    страница загружается и живёт, драйвер получает список вкладок и
+    подключается (`attachToTarget` возвращает `sessionId`), но первая же
+    команда в этой сессии (`Target.setAutoAttach`) получает ответ
+    «Session with given id not found». NEW_SESSION после этого не
+    завершается вообще: selenium ждёт свои 120 секунд, `driver.get()` не
+    выполняется ни разу, а браузер на экране выглядит совершенно рабочим.
+
+    ВАЖНО: от страницы это не зависит — тот же отказ воспроизводился и на
+    корпоративном портале, и на самой странице Onix. Первая версия этого
+    разбора винила стартовую страницу и уводила не туда.
 
     Возвращает готовый текст причины или None, если картина другая.
     """
@@ -423,23 +491,46 @@ def startup_page_hijack(driver_log: Optional[Path]) -> Optional[str]:
         text = Path(driver_log).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    marker_at = text.find(HIJACK_MARKER)
+    marker_at = text.find(REFUSED_MARKER)
     if marker_at < 0:
         return None
 
+    # Если запрет политикой виден прямо в реестре — называем его сразу
+    policy = describe_devtools_policy(read_chrome_policy(DEVTOOLS_POLICY))
+    if policy:
+        return policy
+
     # Адрес вкладки берём ПОСЛЕДНИЙ перед маркером: это ответ attachedToTarget.
-    # Первый по журналу «url» пришёлся бы на дамп Preferences (поисковая
-    # система профиля) и назвал бы не ту страницу.
+    # Первый по журналу «url» пришёлся бы на дамп Preferences и назвал бы
+    # не ту страницу.
     urls = re.findall(r'"url":\s*"([^"]+)"', text[:marker_at])
-    page = urls[-1] if urls else "стартовая страница профиля"
+    page = urls[-1] if urls else "страницу"
+
+    driver_match  = re.search(r"Starting ChromeDriver (\d+(?:\.\d+)+)", text)
+    browser_match = re.search(r'"Browser":\s*"[^/]+/(\d+(?:\.\d+)+)"', text)
+    versions = ""
+    if driver_match or browser_match:
+        versions = (
+            f"Версии из журнала: браузер "
+            f"{browser_match.group(1) if browser_match else 'не определён'}, "
+            f"драйвер {driver_match.group(1) if driver_match else 'не определён'}.\n"
+        )
+
     return (
-        f"Судя по журналу драйвера, первой вкладкой браузер открыл {page} — "
-        "это стартовая страница из настроек профиля или доменной политики. "
-        "Драйвер подключился к ней, страница вкладку переиграла, и сессия "
-        "не создалась (браузер при этом остаётся открытым).\n"
-        "Лечится тем, что стартовую страницу задаём сами: поставьте в "
-        "onix_ft/config.py OPEN_IN_APP_WINDOW = True — браузер откроется сразу "
-        "на адресе Onix отдельным окном, минуя стартовые страницы профиля."
+        f"Браузер открыл {page} и подключение принял, но на первой же команде "
+        "отладки ответил «Session with given id not found» — отладочную сессию "
+        "для вкладки он не отдал. Страница здесь ни при чём: тот же отказ "
+        "повторяется на любом адресе.\n"
+        f"{versions}"
+        "Что проверить:\n"
+        "  1. Ограничения политики домена — откройте chrome://policy и найдите "
+        "DeveloperToolsAvailability, RemoteDebuggingAllowed, URLBlocklist. "
+        "Запрет отладки даёт ровно такую картину.\n"
+        "  2. Сравните chrome://version с машиной, где передача работает: "
+        "сборка Chrome, разрядность (32/64 бита) и командная строка запуска.\n"
+        "  3. Смените канал связи с браузером: USE_DEBUG_PIPE = True в "
+        "onix_ft/config.py — драйвер будет общаться с браузером через pipe, "
+        "а не через порт отладки."
     )
 
 
@@ -451,10 +542,10 @@ def session_failure_hint(
     driver_log: Optional[Path] = None,
 ) -> str:
     """Человекочитаемый разбор для исключения, когда сессия так и не поднялась."""
-    hijack = startup_page_hijack(driver_log)
-    if hijack:
+    refused = debug_session_refused(driver_log)
+    if refused:
         # Причина установлена по журналу — общий чек-лист только запутает
-        return "Сессия браузера не создана.\n" + hijack
+        return "Сессия браузера не создана.\n" + refused
 
     lines = [
         "Браузер не поднялся: драйвер запущен, но сессия не создана.",
@@ -466,7 +557,7 @@ def session_failure_hint(
         "  3. Антивирус или политика домена не блокируют запуск браузера "
         "дочерним процессом.",
         "  4. Если браузер открылся, но остался на корпоративной стартовой "
-        "странице — вкладку автоматизации забрала она: поставьте "
+        "странице и на нужный адрес не перешёл — поставьте "
         "OPEN_IN_APP_WINDOW = True в onix_ft/config.py.",
     ]
     if driver_log:

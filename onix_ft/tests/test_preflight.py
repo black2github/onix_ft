@@ -191,53 +191,100 @@ def test_session_failure_hint_points_to_existing_log(tmp_path):
     assert str(log) in hint
 
 
-# ── угон стартовой вкладки корпоративной политикой ───────────────────────────
+# ── политика домена: запрет средств разработчика ─────────────────────────────
 
-HIJACK_LOG = """\
-[1786439807.487][INFO]: Populating Preferences file: {
+def test_describe_devtools_policy_blocks_only_on_value_2():
+    message = preflight.describe_devtools_policy(2)
+    assert message is not None
+    assert "DeveloperToolsAvailability=2" in message
+    assert "chrome://policy" in message
+
+
+def test_describe_devtools_policy_silent_on_allowing_values():
+    """0/1 разрешают отладку, отсутствие значения ничего не доказывает."""
+    assert preflight.describe_devtools_policy(0) is None
+    assert preflight.describe_devtools_policy(1) is None
+    assert preflight.describe_devtools_policy(None) is None
+
+
+def test_read_chrome_policy_survives_absent_key():
+    """Политика не задана — молча None, без исключения."""
+    assert preflight.read_chrome_policy("НетТакойПолитики") is None
+
+
+def test_debug_session_refused_names_policy_when_registry_shows_it(tmp_path, monkeypatch):
+    log = tmp_path / "driver.log"
+    log.write_text(REFUSED_LOG, encoding="utf-8")
+    monkeypatch.setattr(preflight, "read_chrome_policy", lambda *_a, **_k: 2)
+    message = preflight.debug_session_refused(log)
+    assert "DeveloperToolsAvailability=2" in message
+
+
+# ── браузер не отдал отладочную сессию ───────────────────────────────────────
+
+REFUSED_LOG = """\
+[1786462545.894][INFO]: Starting ChromeDriver 149.0.7827.201 (6a7b3dbec3) on port 53299
+[1786462546.429][INFO]: Populating Preferences file: {
    "default_search_provider": {
       "url": "https://sfera/SitePages/Search.aspx?q={searchTerms}"
    }
 }
-[1786439808.717][DEBUG]: DevTools HTTP Response: [ {
-   "id": "F90F24EAD83D0BC6FD95FA3BED48C874",
-   "type": "page",
-   "url": "https://sfera/"
-} ]
-[1786439808.739][DEBUG]: DevTools WebSocket Command: Target.setAutoAttach (id=3)
-[1786439808.739][DEBUG]: DevTools WebSocket Response:  (id=3) browser \
+[1786462547.554][DEBUG]: DevTools HTTP Response: {
+   "Browser": "Chrome/149.0.7827.103"
+}
+[1786462547.572][DEBUG]: DevTools WebSocket Event: Target.attachedToTarget {
+   "targetInfo": {
+      "type": "tab",
+      "url": "https://webexp.msg.gpb.ru/#/"
+   }
+}
+[1786462547.572][DEBUG]: DevTools WebSocket Command: Target.setAutoAttach (id=3)
+[1786462547.572][DEBUG]: DevTools WebSocket Response:  (id=3) browser \
 {"code":-32001,"message":"Session with given id not found."}
 """
 
 
-def test_startup_page_hijack_detects_and_names_page(tmp_path):
+def test_debug_session_refused_names_page_and_versions(tmp_path):
     log = tmp_path / "driver.log"
-    log.write_text(HIJACK_LOG, encoding="utf-8")
-    message = preflight.startup_page_hijack(log)
+    log.write_text(REFUSED_LOG, encoding="utf-8")
+    message = preflight.debug_session_refused(log)
     assert message is not None
-    assert "OPEN_IN_APP_WINDOW" in message              # назван рычаг, которым лечится
-    # Названа именно перехватившая вкладка, а не поисковик из дампа Preferences
-    assert "открыл https://sfera/ —" in message
+    # Названа именно вкладка, а не поисковик из дампа Preferences
+    assert "открыл https://webexp.msg.gpb.ru/#/ " in message
     assert "searchTerms" not in message
+    # Обе версии из журнала — по ним сверяют пару браузер/драйвер
+    assert "149.0.7827.103" in message and "149.0.7827.201" in message
+    # Направления проверки: политика домена и запасной канал
+    assert "chrome://policy" in message
+    assert "USE_DEBUG_PIPE" in message
 
 
-def test_startup_page_hijack_silent_on_other_logs(tmp_path):
+def test_debug_session_refused_does_not_blame_the_page(tmp_path):
+    """Отказ не зависит от страницы — прежняя формулировка уводила не туда."""
+    log = tmp_path / "driver.log"
+    log.write_text(REFUSED_LOG, encoding="utf-8")
+    message = preflight.debug_session_refused(log)
+    assert "ни при чём" in message
+    assert "OPEN_IN_APP_WINDOW" not in message
+
+
+def test_debug_session_refused_silent_on_other_logs(tmp_path):
     log = tmp_path / "driver.log"
     log.write_text("[INFO]: Starting ChromeDriver\n[INFO]: RESPONSE InitSession", encoding="utf-8")
-    assert preflight.startup_page_hijack(log) is None
+    assert preflight.debug_session_refused(log) is None
 
 
-def test_startup_page_hijack_survives_missing_log(tmp_path):
-    assert preflight.startup_page_hijack(None) is None
-    assert preflight.startup_page_hijack(tmp_path / "нет-такого.log") is None
+def test_debug_session_refused_survives_missing_log(tmp_path):
+    assert preflight.debug_session_refused(None) is None
+    assert preflight.debug_session_refused(tmp_path / "нет-такого.log") is None
 
 
 def test_session_failure_hint_replaces_checklist_when_cause_known(tmp_path):
     """Причина установлена — общий чек-лист не показываем, чтобы не путать."""
     log = tmp_path / "driver.log"
-    log.write_text(HIJACK_LOG, encoding="utf-8")
+    log.write_text(REFUSED_LOG, encoding="utf-8")
     hint = preflight.session_failure_hint(Path(r"C:\onix\profile"), None, log)
-    assert "OPEN_IN_APP_WINDOW" in hint
+    assert "USE_DEBUG_PIPE" in hint
     assert "Что проверить по порядку" not in hint
 
 
@@ -258,6 +305,118 @@ def test_browser_arguments_without_profile():
     args = selenium_driver.browser_arguments(None)
     assert not any(a.startswith("--user-data-dir") for a in args)
     assert "--no-sandbox" in args
+
+
+def test_browser_arguments_debug_pipe_off_by_default():
+    assert "--remote-debugging-pipe" not in selenium_driver.browser_arguments(None)
+
+
+def test_browser_arguments_debug_pipe_on():
+    args = selenium_driver.browser_arguments(None, None, debug_pipe=True)
+    assert "--remote-debugging-pipe" in args
+
+
+# ── снимок ленты чата (разбор потерянных блоков) ─────────────────────────────
+
+def test_feed_record_keeps_diagnostic_fields():
+    record = selenium_driver.feed_record(3, "el-42", seen=True, bubbles=2, text="##FT|v1|данные")
+    assert record["i"] == 3 and record["id"] == "el-42"
+    assert record["seen"] is True
+    assert record["bubbles"] == 2          # склейка сообщений видна в снимке
+    assert record["len"] == len("##FT|v1|данные")
+    assert record["head"].startswith("##FT|v1|")
+
+
+def test_feed_record_flattens_newlines_in_head():
+    record = selenium_driver.feed_record(0, "el-1", seen=False, bubbles=1, text="строка1\nстрока2")
+    assert "\n" not in record["head"]
+    assert record["len"] == len("строка1\nстрока2")   # длина считается по оригиналу
+
+
+def test_feed_record_survives_empty_text():
+    record = selenium_driver.feed_record(0, "el-1", seen=False, bubbles=0, text="")
+    assert record["len"] == 0 and record["head"] == ""
+
+
+def test_append_feed_records_writes_jsonl(tmp_path):
+    import json
+
+    target = tmp_path / "вложенный" / "feed.jsonl"
+    selenium_driver.append_feed_records(target, [
+        selenium_driver.feed_record(0, "a", False, 1, "первое"),
+        selenium_driver.feed_record(1, "b", True, 2, "второе"),
+    ])
+    selenium_driver.append_feed_records(target, [
+        selenium_driver.feed_record(0, "c", False, 1, "третье"),
+    ])
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3                       # дописывает, а не перезаписывает
+    assert json.loads(lines[1])["bubbles"] == 2
+    assert json.loads(lines[2])["head"] == "третье"
+
+
+def test_append_feed_records_ignores_empty_batch(tmp_path):
+    target = tmp_path / "feed.jsonl"
+    selenium_driver.append_feed_records(target, [])
+    assert not target.exists()
+
+
+# ── единицы чтения ленты: склейка сообщений в одну строку ────────────────────
+
+class FakeElement:
+    """Подделка элемента браузера: ровно то, что использует _feed_units."""
+
+    def __init__(self, element_id, text="", bubbles=None):
+        self.id = element_id
+        self.text = text
+        self._bubbles = bubbles or []
+
+    def find_elements(self, _by, _selector):
+        return self._bubbles
+
+
+def _transport():
+    return selenium_driver.OnixSeleniumTransport()
+
+
+def test_feed_units_splits_grouped_row_into_messages():
+    """
+    Регресс инцидента 2026-08-12: строка со склейкой двух сообщений давала
+    одну единицу чтения, второе сообщение терялось молча (блок «пропадал»,
+    приём срывался на NACK).
+    """
+    grouped = FakeElement("row-1", bubbles=[
+        FakeElement("bubble-1", "##FT|блок-3##"),
+        FakeElement("bubble-2", "##FT|блок-4##"),
+    ])
+    units = _transport()._feed_units([grouped])
+
+    assert [key for key, _el, _is_bubble in units] == ["bubble-1", "bubble-2"]
+    assert all(is_bubble for _key, _el, is_bubble in units)
+
+
+def test_feed_units_falls_back_to_row_without_bubbles():
+    """Служебная строка (разделитель дат) остаётся единицей сама по себе."""
+    plain = FakeElement("row-2", "12 августа")
+    units = _transport()._feed_units([plain])
+
+    assert units == [("row-2", plain, False)]
+
+
+def test_feed_units_keys_are_unique_across_rows():
+    rows = [
+        FakeElement("row-1", bubbles=[FakeElement("b1", "первое")]),
+        FakeElement("row-2", bubbles=[FakeElement("b2", "второе"), FakeElement("b3", "третье")]),
+    ]
+    keys = [key for key, _el, _is_bubble in _transport()._feed_units(rows)]
+    assert keys == ["b1", "b2", "b3"]
+    assert len(set(keys)) == len(keys)
+
+
+def test_extract_text_of_bubble_strips_timestamp():
+    bubble = FakeElement("b1", "##FT|v1|данные##\n18:58")
+    assert _transport()._extract_text(bubble, is_bubble=True) == "##FT|v1|данные##"
 
 
 if __name__ == "__main__":
