@@ -72,6 +72,8 @@ class FileReceiver:
         window_size      = max(1, config.WINDOW_SIZE)
         blocks_since_ack = 0   # сколько блоков принято с момента последнего ACK
         last_acked_seq   = -1  # seq последнего подтверждённого блока
+        nudge_interval   = max(1.0, float(getattr(config, "IDLE_NUDGE_SECONDS", 10.0)))
+        silence_since    = time.monotonic()
 
         # ── шаг 2: принимаем DATA-блоки ──────────────────────────────────────
         while not cp.is_complete:
@@ -79,17 +81,28 @@ class FileReceiver:
             expected_seq = missing[0]
 
             logger.info(
-                "Принято %d/%d блоков. Жду блок № %d...",
-                len(cp.received), cp.total_blocks, expected_seq + 1
+                "Принято %d/%d блоков. Жду блок № %d (seq=%d)...",
+                len(cp.received), cp.total_blocks, expected_seq + 1, expected_seq
             )
 
-            frame = self._wait_for_data(cp.file_id, timeout=config.BLOCK_WAIT_TIMEOUT)
+            # Ждём короткими отрезками: молчание канала — тоже событие,
+            # на него нужно ответить подталкиванием, а не смертью по таймауту.
+            frame = self._wait_for_data(cp.file_id, timeout=nudge_interval)
 
             if frame is None:
-                logger.error("Таймаут ожидания блока seq=%d.", expected_seq)
-                self._send_abort(cp.file_id, f"Таймаут блока seq={expected_seq}")
-                return None
+                idle = time.monotonic() - silence_since
+                if idle >= config.BLOCK_WAIT_TIMEOUT:
+                    logger.error(
+                        "Таймаут ожидания блока № %d (seq=%d): тишина %.0f сек.",
+                        expected_seq + 1, expected_seq, idle
+                    )
+                    self._send_abort(cp.file_id, f"Таймаут блока seq={expected_seq}")
+                    return None
+                self._nudge_sender(cp, expected_seq)
+                blocks_since_ack = 0
+                continue
 
+            silence_since = time.monotonic()
             seq = frame.seq
 
             # Дубликат
@@ -99,23 +112,29 @@ class FileReceiver:
                 blocks_since_ack = 0
                 continue
 
-            # Неожиданный блок — пропуск
-            if seq != expected_seq:
-                logger.warning(
-                    "Получен seq=%d, ожидали seq=%d → NACK[%d].",
-                    seq, expected_seq, expected_seq
-                )
-                self._t.send(make_nack_frame(cp.file_id, expected_seq).encode())
-                blocks_since_ack = 0
-                continue
-
-            # Декодируем
+            # Декодируем (и внеочередной блок тоже — он валиден и нужен)
             try:
                 raw = decode_data_payload(frame.payload)
             except Exception as e:
                 logger.warning("Ошибка декодирования seq=%d: %s → NACK.", seq, e)
                 self._t.send(make_nack_frame(cp.file_id, seq).encode())
                 blocks_since_ack = 0
+                continue
+
+            # Блок пришёл ВПЕРЁД: сохраняем, а не выбрасываем.
+            # Прежнее поведение (выбросить + NACK на каждый внеочередной)
+            # превращало потерю одного сообщения в повтор всего окна и
+            # само себя усиливало при потерях в канале (инцидент 2026-08-13,
+            # ~15 % сообщений не доходили с первого раза). Недостающий блок
+            # запрашивается по тишине — см. _nudge_sender.
+            if seq != expected_seq:
+                block_buf[seq] = raw
+                self._save_partial_block(cp, seq, raw)
+                cp.mark_received(seq)
+                logger.info(
+                    "Блок № %d (seq=%d) принят вне очереди — сохранён (ждём № %d).",
+                    seq + 1, seq, expected_seq + 1
+                )
                 continue
 
             # Сохраняем блок
@@ -159,6 +178,30 @@ class FileReceiver:
         self._cleanup_partial_blocks(cp)
         cp.delete()
         return out_path
+
+    def _nudge_sender(self, cp: ReceiverCheckpoint, expected_seq: int) -> None:
+        """
+        Тишина в канале: подтвердить накопленное и запросить недостающий блок.
+
+        Зачем. NACK раньше уходил ТОЛЬКО когда приходил блок с неверным
+        номером. Если терялся ПОСЛЕДНИЙ блок окна, после него не приходило
+        ничего — сигнала для NACK не возникало, и обе стороны молча ждали
+        свои таймауты (инцидент 2026-08-13: приём умирал через 120 секунд
+        тишины, отправитель — по ACK_TIMEOUT). Уменьшение окна только
+        повышало шанс попасть в эту разновидность потери.
+
+        Заодно снимается смертельность рассогласования WINDOW_SIZE между
+        сторонами: ACK по накопленному уходит независимо от того, сколько
+        блоков приёмник считает окном.
+        """
+        if expected_seq > 0:
+            # expected_seq — первый недостающий, значит всё до него принято
+            self._t.send(make_ack_frame(cp.file_id, expected_seq - 1).encode())
+        self._t.send(make_nack_frame(cp.file_id, expected_seq).encode())
+        logger.info(
+            "Тишина в канале: подтвердили блоки по № %d, запросили № %d (seq=%d).",
+            expected_seq, expected_seq + 1, expected_seq
+        )
 
     # ── ожидание META ─────────────────────────────────────────────────────────
 
