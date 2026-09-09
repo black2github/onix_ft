@@ -30,8 +30,28 @@ try:
         TimeoutException, NoSuchElementException, StaleElementReferenceException
     )
     SELENIUM_AVAILABLE = True
-except ImportError:
+    SELENIUM_IMPORT_ERROR = ""
+except ImportError as _e:
+    # Модуль обязан импортироваться и без selenium: чистые помощники
+    # (feed_record, browser_arguments) нужны разборщику ленты и тестам.
+    # Но провал импорта нельзя глотать молча: до 2026-09-08 селекторы ниже
+    # обращались к неопределённому `By`, и вместо причины («selenium не
+    # установлен в этом venv») пользователь получал NameError: name 'By'.
     SELENIUM_AVAILABLE = False
+    SELENIUM_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+    class By:  # заглушка со значениями selenium — чтобы селекторы собрались
+        CSS_SELECTOR = "css selector"
+        XPATH = "xpath"
+
+
+SELENIUM_MISSING_HINT = (
+    "selenium не импортируется в этом окружении: {error}.\n"
+    "Проверьте, что активирован venv из INSTALL.txt, и выполните в нём шаги 3–5:\n"
+    "  python -m pip install --no-index --find-links=wheels -r requirements.txt\n"
+    "  python -m pip check\n"
+    "Какой интерпретатор работает: python -c \"import sys; print(sys.executable)\""
+)
 
 from . import preflight
 from .base import BaseTransport
@@ -146,7 +166,7 @@ class OnixSeleniumTransport(BaseTransport):
 
     def __init__(self):
         if not SELENIUM_AVAILABLE:
-            raise ImportError("Selenium не установлен. pip install selenium")
+            raise ImportError(SELENIUM_MISSING_HINT.format(error=SELENIUM_IMPORT_ERROR))
         self._driver: Optional[webdriver.Chrome] = None
         # Множество внутренних element-ID элементов .chat-message-row,
         # которые уже были обработаны. Новыми считаются только те,
