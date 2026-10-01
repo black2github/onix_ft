@@ -140,10 +140,18 @@ SEL_MESSAGE_BUBBLE = ".chat-message__bubble"
 
 # Элемент чата в списке чатов (ищем по имени чата из config.ONIX_CHAT_NAME).
 # В DOM Onix это div.chat-list-entry, содержащий span с именем чата.
+# Имя сравнивается ТОЧНО (normalize-space): поиск по подстроке (до 2026-10-01)
+# при нескольких чатах с общим фрагментом имени чистил первый найденный.
 SEL_CHAT_BUTTON_TMPL = (
     "//div[contains(@class,'chat-list-entry')]"
-    "[.//span[contains(@class,'chat-list-entry__name') and contains(text(),'{name}')]]"
+    "[.//span[contains(@class,'chat-list-entry__name') and normalize-space(.)='{name}']]"
 )
+
+# Открытый (активный) чат в списке — по нему проверяется, что обмен идёт в том
+# же чате, который будет чиститься. Класс chat-list-entry--active снят с живого
+# DOM Onix (onix_chat_list.html).
+SEL_ACTIVE_CHAT_NAME = (By.CSS_SELECTOR,
+    ".chat-list-entry.chat-list-entry--active .chat-list-entry__name")
 
 # Пункт «Очистить историю чата» в контекстном меню
 SEL_CLEAR_HISTORY_ITEM = (By.XPATH,
@@ -349,6 +357,52 @@ class OnixSeleniumTransport(BaseTransport):
                 "Поле ввода не появилось за отведённое время. "
                 "Проверьте логин и значение SEL_INPUT_BOX."
             )
+        self.check_active_chat()
+
+    def active_chat_name(self) -> Optional[str]:
+        """Имя чата, открытого сейчас в браузере, или None, если список чатов
+        не виден (узкое окно) и определить открытый чат нельзя."""
+        try:
+            els = self._driver.find_elements(*SEL_ACTIVE_CHAT_NAME)
+        except Exception as e:                      # noqa: BLE001 — только диагностика
+            logger.debug("Не удалось прочитать активный чат: %s", e)
+            return None
+        for el in els:
+            name = (el.text or "").strip()
+            if name:
+                return name
+        return None
+
+    def check_active_chat(self) -> None:
+        """Обмен и очистка обязаны идти в ОДНОМ чате.
+
+        Отправка и чтение работают с тем чатом, что открыт в браузере
+        (ONIX_CHAT_URL), а очистка — периодическая и по --clear-history — ищет
+        чат в списке по имени ONIX_CHAT_NAME. До 2026-10-01 эти две настройки
+        никак не сверялись: при изменённом URL и имени по умолчанию
+        «Сохраненные сообщения» передача шла в одном чате, а каждые
+        CLEAR_CHAT_EVERY_N_BLOCKS блоков чистилась история другого.
+        Расхождение — стоп с понятным сообщением; список чатов не виден —
+        предупреждение (сверить нечем).
+        """
+        expected = (config.ONIX_CHAT_NAME or "").strip()
+        actual = self.active_chat_name()
+        if actual is None:
+            logger.warning(
+                "Открытый чат определить не удалось (список чатов не виден). "
+                "Очистка пойдёт в чат «%s» из ONIX_CHAT_NAME — убедитесь, что "
+                "обмен идёт в нём же.", expected)
+            return
+        if actual == expected:
+            logger.info("Открыт чат «%s» — совпадает с ONIX_CHAT_NAME.", actual)
+            return
+        raise RuntimeError(
+            f"В браузере открыт чат «{actual}», а ONIX_CHAT_NAME = «{expected}». "
+            "Обмен шёл бы в первом, а очистка истории (периодическая и "
+            "--clear-history) — во втором. Откройте в Onix чат "
+            f"«{expected}» либо укажите в onix_ft/config.py "
+            f"ONIX_CHAT_NAME = \"{actual}\" и перезапустите."
+        )
 
     def _feed_units(self, rows: list) -> list:
         """

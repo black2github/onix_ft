@@ -113,6 +113,8 @@ def main():
     send_path    = tmp_archive
     auto_extract = True
 
+    from onix_ft import __version__
+    logger.info("onix_ft run_sender — версия %s", __version__)
     try:
         with OnixSeleniumTransport() as transport:
             transport.wait_ready()

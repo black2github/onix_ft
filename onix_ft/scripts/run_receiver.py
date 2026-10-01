@@ -54,6 +54,8 @@ def main():
     out_dir  = Path(args.out_dir)
     ckpt_dir = Path(args.ckpt_dir)
 
+    from onix_ft import __version__
+    logger.info("onix_ft run_receiver — версия %s", __version__)
     with OnixSeleniumTransport() as transport:
         transport.wait_ready()
 
